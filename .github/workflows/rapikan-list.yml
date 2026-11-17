@@ -36,14 +36,14 @@ jobs:
 
           for b in baris:
               b = b.strip()
-              # Lewati header lama agar tidak ganda
-              if b.startswith(("! Title:", "! Maintainer:", "! Version:", "! Total Rules:")):
+              # Lewati header dan garis pemisah lama agar tidak ganda/menumpuk
+              if b.startswith(("! Title:", "! Maintainer:", "! Expires:", "! Version:", "! Total Rules:", "! --------------------------------------------------")):
                   continue
-              # Pertahankan baris kosong dan komentar bagian (! === NAMA SITUS ===)
-              if not b or b.startswith(("!", "#", "[")):
+              # Pertahankan baris kosong, komentar (! atau # tunggal), dan header Adblock ([Adblock...])
+              if not b or b.startswith(("!", "[")) or (b.startswith("#") and not b.startswith(("##", "#@#", "#?#", "#$#"))):
                   hasil.append(b)
                   continue
-              # Buang aturan kosmetik yang terpotong di tengah jalan (diakhiri \ atau > atau :)
+              # Buang aturan kosmetik yang terpotong di tengah jalan
               if "##" in b and b.endswith(("\\", ">", "+", "~", ":")):
                   continue
               # Hapus duplikat persis sambil menjaga urutan aslinya
@@ -59,6 +59,7 @@ jobs:
           header = [
               "! Title: EazyWhale Cosmetic Shield",
               "! Maintainer: EazyWhale",
+              "! Expires: 1 hours",
               f"! Version: {waktu}",
               f"! Total Rules: {len(sudah_ada)}",
               "! --------------------------------------------------",
@@ -72,7 +73,6 @@ jobs:
       - name: Simpan hasil ke GitHub
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@://github.com"
-          git add easyBlock
-          git diff --staged --quiet || (git commit -m "chore: rapikan cosmetic filter" && git push)
-          
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add easyBlock.txt
+          git diff --staged --quiet || (git commit -m "chore: rapikan cosmetic filter [skip ci]" && git push)
