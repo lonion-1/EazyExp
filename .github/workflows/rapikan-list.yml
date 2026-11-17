@@ -1,0 +1,74 @@
+name: Rapikan Cosmetic Filter (Brave)
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'easyBlock'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bersih-cosmetic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil isi repo
+        uses: actions/checkout@v4
+
+      - name: Bersihkan duplikat & aturan rusak tanpa hapus komentar
+        run: |
+          python3 -c '
+          import datetime
+
+          file_target = "easyBlock"
+
+          with open(file_target, "r", encoding="utf-8") as f:
+              baris = f.readlines()
+
+          hasil = []
+          sudah_ada = set()
+
+          for b in baris:
+              b = b.strip()
+              # Lewati header lama agar tidak ganda
+              if b.startswith(("! Title:", "! Maintainer:", "! Version:", "! Total Rules:")):
+                  continue
+              # Pertahankan baris kosong dan komentar bagian (! === NAMA SITUS ===)
+              if not b or b.startswith(("!", "#", "[")):
+                  hasil.append(b)
+                  continue
+              # Buang aturan kosmetik yang terpotong di tengah jalan (diakhiri \ atau > atau :)
+              if "##" in b and b.endswith(("\\", ">", "+", "~", ":")):
+                  continue
+              # Hapus duplikat persis sambil menjaga urutan aslinya
+              if b not in sudah_ada:
+                  sudah_ada.add(b)
+                  hasil.append(b)
+
+          # Rapikan baris kosong berlebih di bagian paling atas
+          while hasil and hasil[0] == "":
+              hasil.pop(0)
+
+          waktu = datetime.datetime.now(datetime.timezone.utc).strftime("%Y.%m.%d.%H%M")
+          header = [
+              "! Title: EazyWhale Cosmetic Shield",
+              "! Maintainer: EazyWhale",
+              f"! Version: {waktu}",
+              f"! Total Rules: {len(sudah_ada)}",
+              "! --------------------------------------------------",
+              ""
+          ]
+
+          with open(file_target, "w", encoding="utf-8") as f:
+              f.write("\n".join(header + hasil) + "\n")
+          '
+
+      - name: Simpan hasil ke GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@://github.com"
+          git add easyBlock
+          git diff --staged --quiet || (git commit -m "chore: rapikan cosmetic filter" && git push)
+          
