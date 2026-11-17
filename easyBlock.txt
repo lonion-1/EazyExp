@@ -1,1 +1,144 @@
+! ==========================================
+! IKIRU
+! ==========================================
+ikiru.wtf##[href*="klik.top/ikiruid"] > .alignnone.size-full.wp-image-733
+ikiru.wtf##[href*="klik.best/ikiru"] > .alignnone.size-full.wp-image-733
+ikiru.wtf##[href*="goratu.site/login"] > .alignnone.size-full.wp-image-733
+ikiru.wtf##[src*="/wp-content/uploads/2025/12/MAMBA_720x100_white.gif"]
+ikiru.wtf##[src*="/wp-content/uploads/2026/01/720x90ikiru-fix.gif"]
+ikiru.wtf##[src*="/wp-content/uploads/2026/04/Royal22.gif"]
+ikiru.wtf##[src*="/wp-content/uploads/2026/05/IMG-20260507-WA0004.jpg"]
+ikiru.wtf##.aligncenter.size-full.wp-image-37341
+ikiru.wtf##.w-full.h-full.grid.grid-cols-1.md\:grid-cols-2.justify-center.items-center.gap-4.my-2\.5.md\:my-5.ads-header-1
+ikiru.wtf##div.flex.justify-between.gap-6.bg-white\/10.p-4.rounded-lg:nth-of-type(1)
+ikiru.wtf##div.flex.justify-between.gap-6.bg-white\/10.p-4.rounded-lg.w-full.col-span-1:nth-of-type(2)
+ikiru.wtf##div.flex.justify-between.gap-6.bg-white\/10.p-4.rounded-lg.w-full.col-span-1:nth-of-type(3)
+ikiru.wtf##div.w-full.swiper-slide:nth-of-type(1) > .flex.flex-col.gap-4 > .p-3.bg-secondary.flex.gap-4.items-center.rounded-xl
+ikiru.wtf##.relative.w-full.overflow-hidden.announcement-slider.my-5.px-10.opacity-0.transition-all.duration-300.\[\[data-show\=\'true\'\]\]\:opacity-100 > .swiper > .swiper-wrapper
+ikiru.wtf###response-data
+ikiru.wtf##.mx-auto.bg-gray-50.text-primary.rounded-md.border-none.outline-none.hover\:bg-accent\/75.hover\:text-gray-100.px-5.py-1\.5.ring-accent\/95.hover\:ring-2.ring-offset-accent\/95.hover\:ring-offset-1.ring-0.transition-all.duration-200.ease-in-out
+ikiru.wtf##.font-semibold.text-xl.mb-1\.25.mx-auto.text-center
+ikiru.wtf##.flex.items-center.justify-end.grow.lg\:grow-0
+ikiru.wtf###full-comments > div.w-full:nth-of-type(2)
 
+! ==========================================
+! SHINIGAMI
+! ==========================================
+shinigami.asia##.fixed.top-0.left-0.w-screen.h-screen.bg-base-bg\/40.backdrop-blur-sm.flex.items-center.justify-center.flex-col.z-\[500\]
+shinigami.asia##.fixed.top-0.left-0.w-screen.h-dvh.bg-base-bg\/80.z-\[500\].bg-blur.flex.flex-col.items-center.justify-center.backdrop-blur-md
+shinigami.asia##.fixed.bottom-0.left-0.w-screen.h-\[calc\(100dvh\)\].md\:h-screen.bg-base-bg\/40.z-\[500\].flex.flex-col.justify-end.items-start
+shinigami.asia##.mb-8.text-base-white.sm\:text-14.text-13.p-8.flex.items-start.justify-between.gap-8
+shinigami.asia##.flex.items-end.justify-between.text-base-white
+shinigami.asia###splide01
+shinigami.asia###splide02-slide01
+shinigami.asia###splide02-slide02
+shinigami.asia###splide02-slide03
+shinigami.asia###splide02-slide04
+shinigami.asia###splide02-slide05 > div.flex.flex-col.gap-16 > a.flex.flex-col.gap-16:nth-of-type(1) > .p-12.bg-base-card.flex.gap-16.items-center.rounded-16
+shinigami.asia###splide02-slide05 > div.flex.flex-col.gap-16 > a.flex.flex-col.gap-16:nth-of-type(2)
+shinigami.asia###splide02 > .flex.items-center.gap-16.justify-center.mt-16 > .flex.items-center.justify-center.gap-8.p-2
+shinigami.asia##.flex.items-center.justify-center.md\:w-64.w-48.aspect-square.rounded-full.bg-base-card.rotate-180
+shinigami.asia##.fixed.z-\[200\].right-12.flex.flex-col.md\:w-64.w-48.aspect-square.rounded-full.md\:bottom-40.bottom-100 > button.flex.items-center.justify-center.md\:w-64.w-48.aspect-square.rounded-full.bg-base-card:nth-of-type(2)
+shinigami.asia##.bg-base-card.border.border-general-300.rounded-12.p-20.mb-24
+shinigami.asia##.px-24.py-16.text-16.leading-22.rounded-8.bg-base-card.text-base-white.border-2.border-base-card.transition-all.duration-200.ease-in-out.opacity-100.hover\:opacity-80.gap-12.flex.items-center
+shinigami.asia##button.px-24.py-16.text-16.leading-22.rounded-8.bg-base-card.text-base-white.border-2.border-base-card.transition-all.duration-200.ease-in-out.opacity-100.hover\:opacity-80:nth-of-type(2)
+shinigami.asia##.px-24.py-16.text-16.leading-22.rounded-8.bg-base-card.text-base-white.border-2.border-base-card.transition-all.duration-200.ease-in-out.opacity-100.hover\:opacity-80.w-full
+shinigami.asia##button.py-12.flex.items-center.gap-12:nth-of-type(3)
+shinigami.asia##.flex.items-center.justify-center.gap-16 > button.md\:w-64.w-48.aspect-square.rounded-full.bg-base-card.flex.items-center.justify-center:nth-of-type(2)
+shinigami.asia##button.md\:w-64.w-48.aspect-square.rounded-full.bg-base-card.flex.items-center.justify-center:nth-of-type(3)
+shinigami.asia###waline > div:nth-of-type(1)
+shinigami.asia##.wl-reaction-list
+shinigami.asia##.wl-reaction-respons
+shinigami.asia##.wl-reaction-title
+shinigami.asia###wl-edit
+shinigami.asia##.wl-actions
+shinigami.asia##.wl-info
+shinigami.asia##.wl-panel
+shinigami.asia##.w-40.h-40.rounded-full
+shinigami.asia##.w-100vw.h-dvh.bg-base-bg.overflow-y-auto
+shinigami.asia##.grid.grid-cols-1.lg\:grid-cols-3.gap-64.lg\:gap-32
+shinigami.asia##.p-24.flex.justify-center.items-center
+shinigami.asia##div.md\:py-24.py-12.px-12.md\:px-24:nth-of-type(2)
+shinigami.asia##div.md\:py-24.py-12.px-12.md\:px-24:nth-of-type(4)
+shinigami.asia##div.md\:py-24.py-12.px-12.md\:px-24:nth-of-type(6) > div.container.mx-auto:nth-of-type(1) > .flex.flex-col.gap-24
+shinigami.asia##.md\:pt-24.pt-4.px-4.md\:px-24
+shinigami.asia##div.lg\:col-span-6.md\:col-span-4.col-span-2:nth-of-type(1) > .container.mx-auto > .grid.grid-cols-1.md\:grid-cols-2.md\:gap-4.gap-4
+shinigami.asia##div.lg\:col-span-6.md\:col-span-4.col-span-2:nth-of-type(26) > .container.mx-auto > .grid.grid-cols-1.md\:grid-cols-2.md\:gap-4.gap-4 > div.bg-base-card.aspect-\[16\/2\].flex.items-center.justify-center.text-base-white.text-10.sm\:text-12.lg\:text-14.text-general-300.text-center.gap-4:nth-of-type(1)
+shinigami.asia##div.lg\:col-span-6.md\:col-span-4.col-span-2:nth-of-type(26) > .container.mx-auto > .grid.grid-cols-1.md\:grid-cols-2.md\:gap-4.gap-4 > div.bg-base-card.aspect-\[16\/2\].flex.items-center.justify-center.text-base-white.text-10.sm\:text-12.lg\:text-14.text-general-300.text-center.gap-4:nth-of-type(2)
+shinigami.asia##div.lg\:col-span-6.md\:col-span-4.col-span-2:nth-of-type(26) > .container.mx-auto > .grid.grid-cols-1.md\:grid-cols-2.md\:gap-4.gap-4 > div.bg-base-card.aspect-\[16\/2\].flex.items-center.justify-center.text-base-white.text-10.sm\:text-12.lg\:text-14.text-general-300.text-center.gap-4:nth-of-type(3)
+shinigami.asia##div.lg\:col-span-6.md\:col-span-4.col-span-2:nth-of-type(26) > .container.mx-auto > .grid.grid-cols-1.md\:grid-cols-2.md\:gap-4.gap-4 > div.bg-base-card.aspect-\[16\/2\].flex.items-center.justify-center.text-base-white.text-10.sm\:text-12.lg\:text-14.text-general-300.text-center.gap-4:nth-of-type(4)
+! Dinonaktifkan sementara karena selektor terlalu umum (berisiko menyembunyikan layout utama):
+! shinigami.asia##.py-12.px-4.md\:px-24
+
+! ==========================================
+! KEIKOMIK
+! ==========================================
+keikomik.web.id###hil-banner1
+keikomik.web.id###hil-banner2
+keikomik.web.id###hil-bannerM1
+keikomik.web.id###agacpk > .▶__wrap > .▶__iframe
+keikomik.web.id###sfjqim > .▶__wrap > .▶__iframe
+keikomik.web.id##.flex.flex-wrap.items-center.justify-center.gap-y-1.text-center
+keikomik.web.id##.text-center.text-sm.text-slate-300.mt-2
+keikomik.web.id##.w-full.bg-slate-900.p-2
+keikomik.web.id##.w-full.min-h-20
+keikomik.web.id##.w-full.min-h-5.mt-2
+keikomik.web.id##.md\:flex.justify-center.text-center.min-h-20.space-y-3.md\:space-x-3.py-2
+keikomik.web.id##.container.mx-auto.max-w-\[1050px\].mt-5 > div:nth-of-type(1)
+keikomik.web.id##.container.mx-auto.max-w-\[1050px\].mt-5 > div.mt-5:nth-of-type(2) > .w-full.flex.justify-center.rounded-b-lg
+keikomik.web.id##div.mt-5:nth-of-type(4) > .w-full.flex.justify-center.rounded-b-lg
+keikomik.web.id##div.mt-5:nth-of-type(5) > div.md\:flex.justify-center.text-center.min-h-20.space-y-3.md\:space-x-3:nth-of-type(1)
+keikomik.web.id##div.md\:flex.justify-center.text-center.min-h-20.space-y-3.md\:space-x-3:nth-of-type(2)
+keikomik.web.id##div.md\:flex.justify-center.text-center.min-h-20.space-y-3.md\:space-x-3:nth-of-type(3)
+keikomik.web.id##div.md\:flex.justify-center.text-center.min-h-20.space-y-3.md\:space-x-3:nth-of-type(4)
+
+! ==========================================
+! KOMIKU
+! ==========================================
+komiku.org###btnMainLogin
+komiku.org###mainAuthLogin
+komiku.org###mainAuthSection > p
+komiku.org###Judul
+komiku.org###main > div:nth-of-type(1) > .comment-section.mobile
+komiku.org##.second_nav
+! Dinonaktifkan sementara karena menyembunyikan menu navigasi utama:
+! komiku.org##nav
+
+! ==========================================
+! DOUJINDESU
+! ==========================================
+doujin.desu.xxx##.flex-1.max-w-\[90rem\].w-full.mx-auto.px-4.sm\:px-6.lg\:px-8.mt-4 > div.w-full.flex-col.items-center.transition-all.duration-300.min-h-\[1px\].gap-2.py-1.flex:nth-of-type(1)
+doujin.desu.xxx##.w-full.p-4.sm\:p-5.flex.items-center.justify-between.text-left.group.cursor-pointer
+doujin.desu.xxx##.flex.flex-col.items-center.justify-center.text-center.mb-8
+doujin.desu.xxx##.mt-6.bg-gray-50.dark\:bg-\[\#18191d\]\/50.py-6.px-2.sm\:p-8.rounded-md.border.border-gray-200.dark\:border-white\/5
+doujin.desu.xxx##.flex.flex-col.sm\:flex-row.sm\:items-center.justify-between.gap-4.border-b.border-gray-100.dark\:border-white\/5.pb-4
+doujin.desu.xxx##.w-full.bg-gray-50.dark\:bg-dark-bg\/50.rounded-xl.px-5.py-4.text-sm.focus\:outline-none.transition-all.resize-none.min-h-\[120px\].font-medium
+doujin.desu.xxx##.bg-gray-50.dark\:bg-white\/5.px-4.py-3.flex.flex-col.sm\:flex-row.items-center.justify-between.border-t.border-gray-100.dark\:border-white\/5.gap-3
+doujin.desu.xxx##.bg-white.dark\:bg-dark-card\/10.p-1.rounded-2xl.border.border-gray-200.dark\:border-white\/5.shadow-sm
+doujin.desu.xxx##.grid.grid-cols-1.md\:grid-cols-2.gap-1.w-full.mb-1
+doujin.desu.xxx##.grid.grid-cols-1.md\:grid-cols-2.gap-1.w-full.mb-0
+doujin.desu.xxx##.mx-auto.w-full.pt-24.pb-0.transition-all.duration-300.px-4.sm\:px-0
+doujin.desu.xxx##.mx-auto.w-full.my-2.transition-all.duration-300.px-4.sm\:px-0 > .w-full.flex-col.items-center.transition-all.duration-300.min-h-\[1px\].gap-1.py-0.flex
+doujin.desu.xxx##.bg-gray-50.dark\:bg-\[\#131314\].py-6.px-2.sm\:p-8.rounded-xl.border.border-gray-200.dark\:border-white\/5.flex.flex-row.justify-center.gap-2\.5.xs\:gap-4.sm\:gap-16.shadow-sm
+doujin.desu.xxx##.scroll-mt-20.mt-6.space-y-6 > .space-y-6 > .py-20.text-center.opacity-30.italic.font-medium.text-gray-500
+doujin.desu.xxx##.mx-auto.w-full.pb-12.px-4.sm\:px-0.space-y-4.transition-all.duration-300
+doujin.desu.xxx##.space-y-4.pt-10
+doujin.desu.xxx##div.w-full.flex-col.items-center.transition-all.duration-300.min-h-\[1px\].gap-2.py-1.flex:nth-of-type(11)
+doujin.desu.xxx##div.scroll-mt-20.mt-6.space-y-6:nth-of-type(9) > .space-y-6
+doujin.desu.xxx##.p-1\.5.text-amber-500.hover\:text-amber-600.hover\:bg-black\/5.dark\:hover\:bg-white\/5.rounded-xl.transition-all.cursor-pointer.animate-pulse.hover\:animate-none
+doujin.desu.xxx##.fixed.right-6.bottom-40.z-\[100\].flex.flex-col.space-y-2
+
+! ==========================================
+! SITUS LAINNYA (Cookie Banner & Widget)
+! ==========================================
+byteful.com##.cookies.active
+evomi.com##.--framer-cookie-banner-container.--framer-cookie-banner-type-simple > div:nth-of-type(1)
+gracemedy.com###wa-popup-main-button
+prefixx.net###hubspot-conversations-iframe
+prefixx.net##.flex.items-center.justify-between.flex-wrap
+rentafriend.com###cookieNotice
+synack.com###w-vulcan-v2-382
+synack.com###wistia_simple_video_412
+synack.com###wistia-l18ii9m0kn-1_popover_overlay
+synack.com##.w-vulcan--background.w-css-reset
+synack.com##.w-ui-container
