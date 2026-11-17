@@ -137,7 +137,8 @@ spicychat.ai##div:has(> div.snap-center div[class*="h-[240px]"])
 spicychat.ai##div.snap-center:has(div[class*="h-[240px]"])
 
 ! Sembunyikan tombol promo bergradien ungu-biru
-spicychat.ai##button:has-text(/Upgrade|Subscribe|Get Plus|Pro/i)
+spicychat.ai##button:has-text(/\b(Upgrade|Subscribe|Get Plus|Go Pro)\b/i)
+spicychat.ai##a:has-text(/\b(Upgrade|Subscribe|Get Plus|Go Pro)\b/i)
 spicychat.ai##.from-purple-9.to-blue-9
 
 ! Sembunyikan bar promo/tombol pendampingnya
