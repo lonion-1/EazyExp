@@ -1,3 +1,8 @@
+! Title: EazyWhale Cosmetic Shield
+! Maintainer: EazyWhale
+! Version: -
+! Total Rules: -
+
 ! ==========================================
 ! IKIRU
 ! ==========================================
