@@ -4,12 +4,16 @@ on:
   push:
     branches: [ main, master ]
     paths:
-      - 'easyBlock'
+      - 'easyBlock.txt'
   workflow_dispatch:
 
 permissions:
   contents: write
 
+concurrency:
+  group: rapikan-list
+  cancel-in-progress: false
+  
 jobs:
   bersih-cosmetic:
     runs-on: ubuntu-latest
@@ -22,7 +26,7 @@ jobs:
           python3 -c '
           import datetime
 
-          file_target = "easyBlock"
+          file_target = "easyBlock.txt"
 
           with open(file_target, "r", encoding="utf-8") as f:
               baris = f.readlines()
