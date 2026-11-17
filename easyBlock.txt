@@ -1,7 +1,9 @@
 ! Title: EazyWhale Cosmetic Shield
 ! Maintainer: EazyWhale
-! Version: -
-! Total Rules: -
+! Expires: 1 hours
+! Version: 2026.11.17.1902
+! Total Rules: 123
+! --------------------------------------------------
 
 ! ==========================================
 ! IKIRU
