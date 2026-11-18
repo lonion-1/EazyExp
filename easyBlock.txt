@@ -152,6 +152,16 @@ spicychat.ai##.from-purple-9.to-blue-9
 spicychat.ai##div[class*="max-w-[557px]"]
 
 ! ==========================================
+! KLIKXXI
+! ==========================================
+klikxxi.org##.gmr-bannerpopup-inner
+klikxxi.org###idmuvi-popup
+klikxxi.org###hsfi-install-banner
+klikxxi.org###footer-sidebar
+klikxxi.org##.idmuvi-topbanner
+klikxxi.org##[src*="88cdn.cloud"]
+
+! ==========================================
 ! SITUS LAINNYA (Cookie Banner & Widget)
 ! ==========================================
 byteful.com##.cookies.active
