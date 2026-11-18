@@ -1,11 +1,12 @@
 ! Title: EazyWhale Cosmetic Shield
-! Copyright (c) 2026 <EazyWhale>
-! License: Mozilla Public License 2.0 (MPL-2.0)
 ! Maintainer: EazyWhale
 ! Expires: 1 hours
-! Version: 2026.11.18.0446
+! Version: 2026.11.18.0818
 ! Total Rules: 130
 ! --------------------------------------------------
+
+! Copyright (c) 2026 <EazyWhale>
+! License: Mozilla Public License 2.0 (MPL-2.0)
 
 ! ==========================================
 ! IKIRU
