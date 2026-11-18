@@ -165,6 +165,35 @@ klikxxi.org##.idmuvi-topbanner
 klikxxi.org##[src*="88cdn.cloud"]
 
 ! ==========================================
+! COSMICSCANS
+! ==========================================
+! 1. Buka kunci scroll halaman (mengatasi efek popup)
+cosmicscans.to##html, body:style(overflow: auto !important; position: static !important;)
+
+! 2. Sembunyikan popup tengah beserta lapisan backdrop/overlay-nya
+cosmicscans.to##.floating-ad
+cosmicscans.to##[class*="floating-ad"]
+cosmicscans.to##div.fixed.inset-0:has([class*="floating-ad"])
+
+! 3. Sembunyikan semua blok iklan banner (atas, tengah, samping, bawah)
+cosmicscans.to##.ad-script-block
+cosmicscans.to##.ad-markup
+cosmicscans.to##.ad-markup__item
+
+! 4. Sembunyikan banner berdasarkan URL tujuan / gambar iklan
+cosmicscans.to##a[href*="info24jamskc.site"]
+cosmicscans.to##a[href*="apabos.com"]
+cosmicscans.to##a[href*="tinyurl.com/cosmicscans"]
+cosmicscans.to##a[href*="tinyurl.com/CosMads"]
+cosmicscans.to##img[src*="cdncid.csmcscns.id/uploads/"]
+
+! ==========================================
+! TEMPLATE ANTI-POPUP & ANTI-KUNCI SCROLL
+! ==========================================
+namadomain.com##html, body:style(overflow: auto !important; position: static !important;)
+namadomain.com##[class*="popup"], [id*="popup"], [class*="floating-ad"], [class*="modal-backdrop"]
+
+! ==========================================
 ! SITUS LAINNYA (Cookie Banner & Widget)
 ! ==========================================
 byteful.com##.cookies.active
