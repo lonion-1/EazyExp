@@ -1,3 +1,9 @@
+EazyExp-Experimental
 ```
-https://raw.githubusercontent.com/lonion-1/EazyWhale/main/easyBlock.txt
+https://raw.githubusercontent.com/lonion-1/EazyExp/main/EazyExp-Experimental.txt
+```
+
+EazyExp-Toggles
+```
+https://raw.githubusercontent.com/lonion-1/EazyExp/main/EazyExp-Toggles.txt
 ```
