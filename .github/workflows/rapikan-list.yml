@@ -1,80 +1,217 @@
-name: Rapikan Cosmetic Filter (Brave)
+name: Rapikan Filter List (EazyExp)
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
     paths:
-      - 'easyBlock.txt'
+      - 'EazyExp-Experimental.txt'
+      - 'EazyExp-Toggles.txt'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: rapikan-list
+  group: rapikan-eazyexp-${{ github.ref }}
   cancel-in-progress: false
-  
+
 jobs:
-  bersih-cosmetic:
+  bersih-filter:
+    # Cegah loop tak berujung dari commit bot sendiri
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+
     steps:
       - name: Ambil isi repo
         uses: actions/checkout@v4
 
-      - name: Bersihkan duplikat & aturan rusak tanpa hapus komentar
+      - name: Validasi & rapikan filter list
         run: |
-          python3 -c '
+          python3 - << 'EOF'
           import datetime
+          import os
+          import re
 
-          file_target = "easyBlock.txt"
+          TARGETS = {
+              "EazyExp-Experimental.txt": "EazyExp - Experimental",
+              "EazyExp-Toggles.txt": "EazyExp - Toggles",
+          }
 
-          with open(file_target, "r", encoding="utf-8") as f:
-              baris = f.readlines()
-
-          hasil = []
-          sudah_ada = set()
-
-          for b in baris:
-              b = b.strip()
-              # Lewati header dan garis pemisah lama agar tidak ganda/menumpuk
-              if b.startswith(("! Title:", "! Maintainer:", "! Expires:", "! Version:", "! Total Rules:", "! --------------------------------------------------")):
-                  continue
-              # Pertahankan baris kosong, komentar (! atau # tunggal), dan header Adblock ([Adblock...])
-              if not b or b.startswith(("!", "[")) or (b.startswith("#") and not b.startswith(("##", "#@#", "#?#", "#$#"))):
-                  hasil.append(b)
-                  continue
-              # Buang aturan kosmetik yang terpotong di tengah jalan
-              if "##" in b and b.endswith(("\\", ">", "+", "~", ":")):
-                  continue
-              # Hapus duplikat persis sambil menjaga urutan aslinya
-              if b not in sudah_ada:
-                  sudah_ada.add(b)
-                  hasil.append(b)
-
-          # Rapikan baris kosong berlebih di bagian paling atas
-          while hasil and hasil[0] == "":
-              hasil.pop(0)
-
-          waktu = datetime.datetime.now(datetime.timezone.utc).strftime("%Y.%m.%d.%H%M")
-          header = [
-              "! Title: EazyWhale Cosmetic Shield",
-              "! Copyright (c) 2026 <EazyWhale>",
-              "! License: Mozilla Public License 2.0 (MPL-2.0)",
-              "! Maintainer: EazyWhale",
-              "! Expires: 1 hours",
-              f"! Version: {waktu}",
-              f"! Total Rules: {len(sudah_ada)}",
+          HEADER_PREFIXES = (
+              "! Title:",
+              "! Copyright",
+              "! License:",
+              "! Maintainer:",
+              "! Expires:",
+              "! Version:",
+              "! Total Rules:",
               "! --------------------------------------------------",
-              ""
-          ]
+          )
 
-          with open(file_target, "w", encoding="utf-8") as f:
-              f.write("\n".join(header + hasil) + "\n")
-          '
+          COSMETIC_SEPS = ("#@$?#", "#$?#", "#@$#", "#@?#", "#@#", "#?#", "#$#", "##")
+          COSMETIC_PATTERN = re.compile(r"^(.*?)(#@\$\?#|#\$\?#|#@\$#|#@\?#|#@#|#\?#|#\$#|##)(.*)$")
+
+          def is_balanced(text: str) -> bool:
+              # Abaikan karakter yang di-escape (misal \( atau \[) dan literal regex /.../
+              cleaned = re.sub(r"\\.", "", text)
+              cleaned = re.sub(r"/(?:\\.|[^/\\])+/", "REGEX", cleaned)
+
+              stack = []
+              pairs = {")": "(", "]": "["}
+              for ch in cleaned:
+                  if ch in "([":
+                      stack.append(ch)
+                  elif ch in ")]":
+                      if not stack or stack[-1] != pairs[ch]:
+                          return False
+                      stack.pop()
+              return len(stack) == 0
+
+          def validate_and_normalize_rule(rule: str):
+              # Cek aturan kosmetik / scriptlet / procedural
+              match = COSMETIC_PATTERN.match(rule)
+              if match:
+                  domains_raw, sep, body = match.groups()
+                  body = body.strip()
+
+                  if not body:
+                      return None, "Body aturan kosmetik kosong"
+
+                  if body.endswith(("\\", ">", "+", "~", ":", ",")):
+                      return None, "Aturan kosmetik terpotong di akhir"
+
+                  if not is_balanced(body):
+                      return None, "Tanda kurung () atau [] tidak seimbang"
+
+                  # Rapikan daftar domain (hapus spasi berlebih di sekitar koma)
+                  if domains_raw.strip():
+                      domain_parts = [d.strip() for d in domains_raw.split(",")]
+                      if any(d in ("", "~") for d in domain_parts):
+                          return None, "Daftar domain mengandung koma kosong/tidak valid"
+                      domains_clean = ",".join(domain_parts)
+                  else:
+                      domains_clean = ""
+
+                  return f"{domains_clean}{sep}{body}", None
+
+              # Cek aturan network / toggle ($options)
+              if "$" in rule and not rule.startswith(("!", "[")):
+                  if rule.endswith("$"):
+                      return None, "Opsi network rule ($) kosong"
+                  if rule.endswith(","):
+                      return None, "Opsi network rule terpotong (,)"
+                  if not is_balanced(rule):
+                      return None, "Tanda kurung pada network rule tidak seimbang"
+
+              return rule, None
+
+          summary_lines = ["### Ringkasan Pembersihan Filter List (`EazyExp`)\n"]
+          waktu = datetime.datetime.now(datetime.timezone.utc).strftime("%Y.%m.%d.%H%M")
+
+          for file_target, title in TARGETS.items():
+              if not os.path.exists(file_target):
+                  summary_lines.append(f"- **{file_target}**: File tidak ditemukan, dilewati.")
+                  continue
+
+              with open(file_target, "r", encoding="utf-8-sig") as f:
+                  raw_lines = f.read().splitlines()
+
+              hasil = []
+              sudah_ada = set()
+              duplikat_count = 0
+              rusak_list = []
+              format_header = None
+              rule_sebelumnya = 0
+
+              for idx, line in enumerate(raw_lines, start=1):
+                  # Bersihkan whitespace & karakter zero-width tak terlihat
+                  b = line.replace("\u200b", "").strip()
+
+                  # Tangkap header format standar jika ada (misal [Adblock Plus 2.0])
+                  if not format_header and re.match(r"^\[(Adblock|uBlock).*\]$", b, re.IGNORECASE):
+                      format_header = b
+                      continue
+
+                  # Lewati seluruh blok metadata lama agar tidak menumpuk
+                  if b.startswith(HEADER_PREFIXES):
+                      continue
+
+                  # Pertahankan baris kosong (maksimal 1 berurutan)
+                  if not b:
+                      if hasil and hasil[-1] != "":
+                          hasil.append("")
+                      continue
+
+                  # Pertahankan komentar (! atau # tunggal, termasuk preprocessor !#if / !#endif)
+                  if b.startswith("!") or (b.startswith("#") and not b.startswith(COSMETIC_SEPS)):
+                      hasil.append(b)
+                      continue
+
+                  rule_sebelumnya += 1
+                  normalized_rule, error_reason = validate_and_normalize_rule(b)
+
+                  if error_reason:
+                      rusak_list.append((idx, b, error_reason))
+                      continue
+
+                  if normalized_rule in sudah_ada:
+                      duplikat_count += 1
+                      continue
+
+                  sudah_ada.add(normalized_rule)
+                  hasil.append(normalized_rule)
+
+              # Rapikan baris kosong di awal dan akhir isi
+              while hasil and hasil[0] == "":
+                  hasil.pop(0)
+              while hasil and hasil[-1] == "":
+                  hasil.pop()
+
+              # Fail-safe: cegah penimpaan file jika sebelumnya ada aturan tapi hasilnya 0
+              if rule_sebelumnya > 0 and len(sudah_ada) == 0:
+                  raise RuntimeError(f"Aborted: Semua aturan di {file_target} terdeteksi tidak valid!")
+
+              header = []
+              if format_header:
+                  header.append(format_header)
+
+              header.extend([
+                  f"! Title: {title}",
+                  "! Copyright (c) 2026 <EazyWhale>",
+                  "! License: Mozilla Public License 2.0 (MPL-2.0)",
+                  "! Maintainer: EazyWhale",
+                  "! Expires: 1 hour",
+                  f"! Version: {waktu}",
+                  f"! Total Rules: {len(sudah_ada)}",
+                  "! --------------------------------------------------",
+                  "",
+              ])
+
+              with open(file_target, "w", encoding="utf-8", newline="\n") as f:
+                  f.write("\n".join(header + hasil) + "\n")
+
+              summary_lines.append(
+                  f"- **{file_target}**: **{len(sudah_ada)}** aturan aktif "
+                  f"({duplikat_count} duplikat dihapus, {len(rusak_list)} aturan rusak dihapus)"
+              )
+              for line_no, bad_rule, reason in rusak_list:
+                  summary_lines.append(f"  - Baris `{line_no}` dihapus (*{reason}*): `{bad_rule}`")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as sf:
+                  sf.write("\n".join(summary_lines) + "\n")
+          EOF
 
       - name: Simpan hasil ke GitHub
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add easyBlock.txt
-          git diff --staged --quiet || (git commit -m "chore: rapikan cosmetic filter [skip ci]" && git push)
+          git add EazyExp-Experimental.txt EazyExp-Toggles.txt
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: rapikan filter list EazyExp [skip ci]"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi
