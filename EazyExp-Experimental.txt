@@ -30,3 +30,13 @@
 
 *api.lab.amplitude.com
 *api2.amplitude.com
+
+! ==========================================
+! Webtoon
+! ==========================================
+
+*ms.applovin.com
+*prebid-server.rubiconproject.com
+*sdkapi.dsp-moloco.com
+*sdkopmetrics-asia.dsp-api.moloco.com
+*sdkopmetrucs-us.dsp-api.moloco.com
