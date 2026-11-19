@@ -23,3 +23,10 @@
 *ads.infinixmobility.com
 *push.infinixmobility.com
 *log.infinixmobility.com
+
+! ==========================================
+! Kredivo
+! ==========================================
+
+*api.lab.amplitude.com
+*api2.amplitude.com
