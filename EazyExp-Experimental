@@ -1,0 +1,25 @@
+! Title: EazyExp Custom Source - Infinix / Tecno / itel (Transsion)
+! Description: Pemblokir telemetri, Palm Store, dan AHA Games tanpa memutus OTA Update
+
+! --- Telemetri & Analitik Transsion ---
+*ad.transsion.com
+*ads.transsion.com
+*log.transsion.com
+*track.transsion.com
+*analytics.transsion.com
+*data.transsion.com
+*push.transsion.com
+*report.transsion.com
+
+! --- Palm Store & Palmplay ---
+*palmplay.com
+*palmstore.com
+
+! --- AHA Games ---
+*ahagamecenter.com
+*ahagames.com
+
+! --- Iklan & Rekomendasi XOS / Infinix ---
+*ads.infinixmobility.com
+*push.infinixmobility.com
+*log.infinixmobility.com
