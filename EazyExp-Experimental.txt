@@ -1,4 +1,12 @@
-! Title: EazyExp Custom Source - Infinix / Tecno / itel (Transsion)
+! Title: EazyExp - Experimental
+! Copyright (c) 2026 <EazyWhale>
+! License: Mozilla Public License 2.0 (MPL-2.0)
+! Maintainer: EazyWhale
+! Expires: 1 hour
+! Version: 2026.11.19.1009
+! Total Rules: 22
+! --------------------------------------------------
+
 ! Description: Pemblokir telemetri, Palm Store, dan AHA Games tanpa memutus OTA Update
 
 ! --- Telemetri & Analitik Transsion ---
