@@ -50,12 +50,13 @@ jobs:
               "! --------------------------------------------------",
           )
 
-          COSMETIC_SEPS = ("#@$?#", "#$?#", "#@$#", "#@?#", "#@#", "#?#", "#$#", "##")
-          COSMETIC_PATTERN = re.compile(r"^(.*?)(#@\$\?#|#\$\?#|#@\$#|#@\?#|#@#|#\?#|#\$#|##)(.*)$")
+          COSMETIC_SEPS = ("#@$?#", "#$?#", "#@$#", "#@?#", "#@%#", "#@#", "#?#", "#$#", "#%#", "##")
+          COSMETIC_PATTERN = re.compile(r"^(.*?)(#@\$\?#|#\$\?#|#@\$#|#@\?#|#@%#|#@#|#\?#|#\$#|#%#|##)(.*)$")
 
           def is_balanced(text: str) -> bool:
-              # Abaikan karakter yang di-escape (misal \( atau \[) dan literal regex /.../
+              # Abaikan karakter escape (\), string dalam kutip ("..." / '...'), dan literal regex /.../
               cleaned = re.sub(r"\\.", "", text)
+              cleaned = re.sub(r'"[^"]*"|\'[^\']*\'', '""', cleaned)
               cleaned = re.sub(r"/(?:\\.|[^/\\])+/", "REGEX", cleaned)
 
               stack = []
@@ -126,25 +127,20 @@ jobs:
               rule_sebelumnya = 0
 
               for idx, line in enumerate(raw_lines, start=1):
-                  # Bersihkan whitespace & karakter zero-width tak terlihat
                   b = line.replace("\u200b", "").strip()
 
-                  # Tangkap header format standar jika ada (misal [Adblock Plus 2.0])
                   if not format_header and re.match(r"^\[(Adblock|uBlock).*\]$", b, re.IGNORECASE):
                       format_header = b
                       continue
 
-                  # Lewati seluruh blok metadata lama agar tidak menumpuk
                   if b.startswith(HEADER_PREFIXES):
                       continue
 
-                  # Pertahankan baris kosong (maksimal 1 berurutan)
                   if not b:
                       if hasil and hasil[-1] != "":
                           hasil.append("")
                       continue
 
-                  # Pertahankan komentar (! atau # tunggal, termasuk preprocessor !#if / !#endif)
                   if b.startswith("!") or (b.startswith("#") and not b.startswith(COSMETIC_SEPS)):
                       hasil.append(b)
                       continue
@@ -163,13 +159,11 @@ jobs:
                   sudah_ada.add(normalized_rule)
                   hasil.append(normalized_rule)
 
-              # Rapikan baris kosong di awal dan akhir isi
               while hasil and hasil[0] == "":
                   hasil.pop(0)
               while hasil and hasil[-1] == "":
                   hasil.pop()
 
-              # Fail-safe: cegah penimpaan file jika sebelumnya ada aturan tapi hasilnya 0
               if rule_sebelumnya > 0 and len(sudah_ada) == 0:
                   raise RuntimeError(f"Aborted: Semua aturan di {file_target} terdeteksi tidak valid!")
 
@@ -212,6 +206,11 @@ jobs:
           git add EazyExp-Experimental.txt EazyExp-Toggles.txt
           if ! git diff --staged --quiet; then
             git commit -m "chore: rapikan filter list EazyExp [skip ci]"
-            git pull --rebase origin "${GITHUB_REF_NAME}"
-            git push
+            for i in 1 2 3; do
+              if git pull --rebase origin "${GITHUB_REF_NAME}" && git push; then
+                exit 0
+              fi
+              sleep 5
+            done
+            exit 1
           fi
