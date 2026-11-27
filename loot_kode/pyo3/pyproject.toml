@@ -1,0 +1,82 @@
+[project]
+requires-python = ">=3.9"
+name = "pyo3"
+dynamic = ["version"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+"__init__.py" = ["F403"]
+"noxfile.py" = ["BLE001", "TRY002"]
+
+[tool.towncrier]
+filename = "CHANGELOG.md"
+version = "0.30.0"
+start_string = "<!-- towncrier release notes start -->\n"
+template = ".towncrier.template.md"
+title_format = "## [{version}] - {project_date}"
+issue_format = "[#{issue}](https://github.com/PyO3/pyo3/pull/{issue})"  # Note PyO3 shows pulls, not issues, in the CHANGELOG
+underlines = ["", "", ""]
+directory = "newsfragments"
+
+[tool.towncrier.fragment.packaging]
+name = "Packaging"
+
+[tool.towncrier.fragment.added]
+name = "Added"
+
+[tool.towncrier.fragment.changed]
+name = "Changed"
+
+[tool.towncrier.fragment.removed]
+name = "Removed"
+
+[tool.towncrier.fragment.fixed]
+name = "Fixed"
+
+[tool.rumdl]
+
+disable = [
+    # TODO: what to do about inline HTML, probably allow?
+    "MD033",
+    # TODO: {{#PYO3_DOCS_URL}} placeholder confuses rumdl, change syntax perhaps?
+    "MD051"
+]
+
+exclude = [
+    # just has an include to the top-level files
+    "guide/src/changelog.md",
+    "guide/src/contributing.md"
+]
+
+[tool.rumdl.per-file-ignores]
+"guide/pyclass-parameters.md" = ["MD041"]
+
+[tool.rumdl.MD004]
+style = "dash"
+
+[tool.rumdl.MD013]
+line_length = 0
+code_blocks = false
+tables = false
+headings = false
+reflow = true
+reflow_mode = "sentence-per-line"
+
+[tool.rumdl.MD046]
+style = "fenced"
+
+[tool.uv]
+package = false
+
+[tool.uv.dependency-groups]
+codecov = { requires-python = ">=3.14" }
+dev = { requires-python = ">=3.14" }
+
+[dependency-groups]
+codecov = ["codecov-cli"]
+nox = ["nox"]
+dev = [
+  "ruff",
+  "rumdl",
+  "typos",
+  "zizmor",
+]

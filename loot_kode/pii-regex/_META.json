@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:16.685146+00:00",
+  "name": "pii-regex",
+  "repo": "madisonmay/CommonRegex",
+  "branch": "master",
+  "license": "MIT",
+  "stars": 1578,
+  "commit_sha": "2425abdb79c8992b8b655c27e1fb195cc54457ab",
+  "last_commit_date": "2019-09-25T12:17:08Z",
+  "files_count": 6,
+  "total_bytes": 24443,
+  "output_dir": "./loot_kode/pii-regex"
+}

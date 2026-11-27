@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyo3-mixed"
+classifiers = [
+    "Programming Language :: Python",
+    "Programming Language :: Rust"
+]
+requires-python = ">=3.9"
+dependencies = ["boltons"]
+license = "MIT"
+readme = "README.md"
+dynamic = ["version"]
+
+[project.scripts]
+get_42 = "pyo3_mixed:get_42"
+print_cli_args = "pyo3_mixed:print_cli_args"
+
+[dependency-groups]
+pgo = ["attrs"]
+
+[tool.maturin]
+include = ["pyo3_mixed/assets/*"]
+pgo-dependency-group = "pgo"
+pgo-command = "python pgo_check.py"

@@ -1,0 +1,652 @@
+mod detection;
+
+pub use detection::{
+    CrateDependencies, find_bridge, find_bridge_with_deps, has_windows_import_lib_support,
+    upgrade_bridge_stable_abi,
+};
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::str::FromStr;
+
+use anyhow::Context;
+use serde::{Deserialize, Serialize};
+
+use crate::python_interpreter::{
+    MAXIMUM_PYPY_MINOR, MAXIMUM_PYTHON_MINOR, MINIMUM_PYPY_MINOR, MINIMUM_PYTHON_MINOR,
+    PythonInterpreter,
+};
+
+/// First CPython minor version that supports PEP 803 stable ABI wheels.
+pub const ABI3T_MINIMUM_PYTHON_MINOR: u8 = 15;
+
+/// pyo3 binding crate
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PyO3Crate {
+    /// pyo3
+    PyO3,
+    /// pyo3-ffi
+    PyO3Ffi,
+}
+
+impl PyO3Crate {
+    /// Returns the name of the crate as a string
+    pub fn as_str(&self) -> &str {
+        match self {
+            PyO3Crate::PyO3 => "pyo3",
+            PyO3Crate::PyO3Ffi => "pyo3-ffi",
+        }
+    }
+}
+
+impl fmt::Debug for PyO3Crate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl fmt::Display for PyO3Crate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for PyO3Crate {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pyo3" => Ok(PyO3Crate::PyO3),
+            "pyo3-ffi" => Ok(PyO3Crate::PyO3Ffi),
+            _ => anyhow::bail!("unknown binding crate: {}", s),
+        }
+    }
+}
+
+/// The `bindings` input spelling accepted on the CLI (`--bindings`) and in
+/// `[tool.maturin] bindings`.
+///
+/// This is the raw, user-facing choice of binding model, kept deliberately
+/// distinct from the resolved [`BridgeModel`]: auto-detection and resolved PyO3
+/// metadata are semantic build states, whereas this enum only names the
+/// accepted input spellings. [`find_bridge`] converts it into a [`BridgeModel`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bindings {
+    /// pyo3
+    PyO3,
+    /// pyo3-ffi
+    PyO3Ffi,
+    /// cffi
+    Cffi,
+    /// uniffi
+    UniFfi,
+    /// bin
+    Bin,
+}
+
+impl Bindings {
+    /// All accepted bindings, in declaration order.
+    pub const ALL: [Bindings; 5] = [
+        Bindings::PyO3,
+        Bindings::PyO3Ffi,
+        Bindings::Cffi,
+        Bindings::UniFfi,
+        Bindings::Bin,
+    ];
+
+    /// The accepted spellings as strings, derived from [`Bindings::as_str`].
+    ///
+    /// This is the single list handed to serde, clap and schemars when they
+    /// need to enumerate or reject variants.
+    pub const VARIANTS: [&'static str; 5] = [
+        Bindings::PyO3.as_str(),
+        Bindings::PyO3Ffi.as_str(),
+        Bindings::Cffi.as_str(),
+        Bindings::UniFfi.as_str(),
+        Bindings::Bin.as_str(),
+    ];
+
+    /// Returns the canonical spelling of this bindings type.
+    ///
+    /// This is the one place each spelling is written; `FromStr`, `Display`,
+    /// serde, clap and schemars all derive from it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Bindings::PyO3 => "pyo3",
+            Bindings::PyO3Ffi => "pyo3-ffi",
+            Bindings::Cffi => "cffi",
+            Bindings::UniFfi => "uniffi",
+            Bindings::Bin => "bin",
+        }
+    }
+
+    /// A one-line human description of this bindings type, used as the
+    /// per-variant documentation in the generated JSON schema.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Bindings::PyO3 => "PyO3 bindings",
+            Bindings::PyO3Ffi => "pyo3-ffi (raw FFI) bindings",
+            Bindings::Cffi => "CFFI bindings",
+            Bindings::UniFfi => "UniFFI bindings",
+            Bindings::Bin => "Rust binary",
+        }
+    }
+}
+
+impl fmt::Display for Bindings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Bindings {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Bindings::ALL
+            .into_iter()
+            .find(|binding| binding.as_str() == s)
+            .with_context(|| {
+                format!(
+                    "unknown bindings type `{s}`, expected one of {}",
+                    Bindings::VARIANTS.join(", ")
+                )
+            })
+    }
+}
+
+impl Serialize for Bindings {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Bindings {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BindingsVisitor;
+
+        impl serde::de::Visitor<'_> for BindingsVisitor {
+            type Value = Bindings;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a bindings type")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Bindings, E>
+            where
+                E: serde::de::Error,
+            {
+                Bindings::ALL
+                    .into_iter()
+                    .find(|binding| binding.as_str() == value)
+                    .ok_or_else(|| E::unknown_variant(value, &Bindings::VARIANTS))
+            }
+        }
+
+        deserializer.deserialize_str(BindingsVisitor)
+    }
+}
+
+impl clap::ValueEnum for Bindings {
+    fn value_variants<'a>() -> &'a [Self] {
+        &Bindings::ALL
+    }
+
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(clap::builder::PossibleValue::new(self.as_str()))
+    }
+}
+
+#[cfg(feature = "schemars")]
+impl schemars::JsonSchema for Bindings {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Bindings".into()
+    }
+
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        "maturin::Bindings".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        // Document the string form (e.g. "pyo3", "cffi") so the schema matches
+        // serde Deserialize/Serialize rather than an externally-tagged object.
+        // Emit one `const` per variant with a description, mirroring the house
+        // style of the other documented string enums (e.g. `CargoCrateType`).
+        let one_of: Vec<serde_json::Value> = Bindings::ALL
+            .iter()
+            .map(|binding| {
+                serde_json::json!({
+                    "description": binding.description(),
+                    "type": "string",
+                    "const": binding.as_str(),
+                })
+            })
+            .collect();
+        schemars::json_schema!({
+            "description": "The kind of bindings to use.",
+            "oneOf": one_of,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PyO3VersionMetadataRaw {
+    #[serde(rename = "min-version")]
+    pub min_version: String,
+    #[serde(rename = "max-version")]
+    pub max_version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PyO3MetadataRaw {
+    pub cpython: PyO3VersionMetadataRaw,
+    pub pypy: PyO3VersionMetadataRaw,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PyO3VersionMetadata {
+    pub min_minor: usize,
+    pub max_minor: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PyO3Metadata {
+    pub cpython: PyO3VersionMetadata,
+    pub pypy: PyO3VersionMetadata,
+}
+
+impl TryFrom<PyO3VersionMetadataRaw> for PyO3VersionMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: PyO3VersionMetadataRaw) -> Result<Self, Self::Error> {
+        let min_version = raw
+            .min_version
+            .rsplit('.')
+            .next()
+            .context("invalid min-version in pyo3-ffi metadata")?
+            .parse()?;
+        let max_version = raw
+            .max_version
+            .rsplit('.')
+            .next()
+            .context("invalid max-version in pyo3-ffi metadata")?
+            .parse()?;
+        Ok(Self {
+            min_minor: min_version,
+            max_minor: max_version,
+        })
+    }
+}
+
+impl TryFrom<PyO3MetadataRaw> for PyO3Metadata {
+    type Error = anyhow::Error;
+
+    fn try_from(raw: PyO3MetadataRaw) -> Result<Self, Self::Error> {
+        Ok(Self {
+            cpython: PyO3VersionMetadata::try_from(raw.cpython)?,
+            pypy: PyO3VersionMetadata::try_from(raw.pypy)?,
+        })
+    }
+}
+
+/// struct describing ABI layout to use for build
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StableAbi {
+    /// The "kind" of stable ABI. Either abi3 or abi3t currently.
+    pub kind: StableAbiKind,
+    /// The minimum Python version to build for.
+    pub version: StableAbiVersion,
+}
+
+impl StableAbi {
+    /// Create a StableAbi instance from a known abi3 version
+    pub fn from_abi3_version(major: u8, minor: u8) -> StableAbi {
+        StableAbi {
+            kind: StableAbiKind::Abi3,
+            version: StableAbiVersion::Version(major, minor),
+        }
+    }
+
+    /// Create a StableAbi instance from a known abi3t version
+    pub fn from_abi3t_version(major: u8, minor: u8) -> StableAbi {
+        StableAbi {
+            kind: StableAbiKind::Abi3t,
+            version: StableAbiVersion::Version(major, minor),
+        }
+    }
+}
+
+/// Python version to use as the abi3/abi3t target.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StableAbiVersion {
+    /// Stable ABI wheels will have a minimum Python version matching the
+    /// version of the current Python interpreter
+    CurrentPython,
+    /// Stable ABI wheels will have a fixed user-specified minimum Python
+    /// version
+    Version(u8, u8),
+}
+
+impl StableAbiVersion {
+    /// Convert `StableAbiVersion` into an Option, where CurrentPython maps to None
+    pub fn min_version(&self) -> Option<(u8, u8)> {
+        match self {
+            StableAbiVersion::CurrentPython => None,
+            StableAbiVersion::Version(major, minor) => Some((*major, *minor)),
+        }
+    }
+}
+
+/// The "kind" of stable ABI. Either abi3 or abi3t currently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StableAbiKind {
+    /// The original stable ABI, supporting Python 3.2 and up
+    Abi3,
+    /// The free-threaded stable ABI, supporting Python 3.15 and up
+    Abi3t,
+}
+
+impl fmt::Display for StableAbiKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StableAbiKind::Abi3 => write!(f, "abi3"),
+            StableAbiKind::Abi3t => write!(f, "abi3t"),
+        }
+    }
+}
+
+impl StableAbiKind {
+    /// The ABI tags to use for wheel building
+    pub fn wheel_tag(&self) -> BTreeSet<String> {
+        match self {
+            StableAbiKind::Abi3 => BTreeSet::from(["abi3".to_string()]),
+            StableAbiKind::Abi3t => BTreeSet::from(["abi3".to_string(), "abi3t".to_string()]),
+        }
+    }
+}
+
+/// The name and version of the pyo3 bindings crate
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PyO3 {
+    /// The name of the bindings crate, `pyo3` or `pyo3-ffi`
+    pub crate_name: PyO3Crate,
+    /// pyo3 bindings crate version
+    pub version: semver::Version,
+    /// Stable ABI support.
+    pub stable_abi: Option<StableAbi>,
+    /// pyo3 metadata
+    pub metadata: Option<PyO3Metadata>,
+}
+
+impl PyO3 {
+    /// Returns the minimum python minor version supported
+    fn minimal_python_minor_version(&self) -> usize {
+        let major_version = self.version.major;
+        let minor_version = self.version.minor;
+        // N.B. must check large minor versions first
+        let min_minor = if let Some(metadata) = self.metadata.as_ref() {
+            metadata.cpython.min_minor
+        } else if (major_version, minor_version) >= (0, 16) {
+            7
+        } else {
+            MINIMUM_PYTHON_MINOR
+        };
+        if let Some(stable_abi) = self.stable_abi.as_ref() {
+            if let StableAbiVersion::Version(_, abi3_minor) = stable_abi.version {
+                min_minor.max(abi3_minor as usize)
+            } else {
+                min_minor
+            }
+        } else {
+            min_minor
+        }
+    }
+
+    /// Returns the maximum python minor version supported
+    fn maximum_python_minor_version(&self) -> usize {
+        // N.B. must check large minor versions first
+        if let Some(metadata) = self.metadata.as_ref() {
+            metadata.cpython.max_minor
+        } else {
+            MAXIMUM_PYTHON_MINOR
+        }
+    }
+
+    /// Returns the minimum PyPy minor version supported
+    fn minimal_pypy_minor_version(&self) -> usize {
+        let major_version = self.version.major;
+        let minor_version = self.version.minor;
+        // N.B. must check large minor versions first
+        if let Some(metadata) = self.metadata.as_ref() {
+            metadata.pypy.min_minor
+        } else if (major_version, minor_version) >= (0, 23) {
+            9
+        } else if (major_version, minor_version) >= (0, 14) {
+            7
+        } else {
+            MINIMUM_PYPY_MINOR
+        }
+    }
+
+    /// Returns the maximum PyPy minor version supported
+    fn maximum_pypy_minor_version(&self) -> usize {
+        // N.B. must check large minor versions first
+        if let Some(metadata) = self.metadata.as_ref() {
+            metadata.pypy.max_minor
+        } else {
+            MAXIMUM_PYPY_MINOR
+        }
+    }
+
+    /// free-threaded Python support
+    fn supports_free_threaded(&self) -> bool {
+        let major_version = self.version.major;
+        let minor_version = self.version.minor;
+        (major_version, minor_version) >= (0, 23)
+    }
+}
+
+/// The way the rust code is used in the wheel
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BridgeModel {
+    /// A rust binary to be shipped a python package
+    Bin(Option<PyO3>),
+    /// A native module with pyo3 bindings.
+    PyO3(PyO3),
+    /// A native module with c bindings, i.e. `#[no_mangle] extern "C" <some item>`
+    Cffi,
+    /// A native module generated from uniffi
+    UniFfi,
+}
+
+impl BridgeModel {
+    /// Returns the pyo3 bindings
+    pub fn pyo3(&self) -> Option<&PyO3> {
+        match self {
+            BridgeModel::Bin(Some(bindings)) => Some(bindings),
+            BridgeModel::PyO3(bindings) => Some(bindings),
+            _ => None,
+        }
+    }
+
+    /// Test whether this is using pyo3/pyo3-ffi
+    pub fn is_pyo3(&self) -> bool {
+        matches!(self, BridgeModel::PyO3(_) | BridgeModel::Bin(Some(_)))
+    }
+
+    /// Test whether this is using a specific pyo3 crate
+    pub fn is_pyo3_crate(&self, name: PyO3Crate) -> bool {
+        match self {
+            BridgeModel::Bin(Some(bindings)) => bindings.crate_name == name,
+            BridgeModel::PyO3(bindings) => bindings.crate_name == name,
+            _ => false,
+        }
+    }
+
+    /// Test whether this is bin bindings
+    pub fn is_bin(&self) -> bool {
+        matches!(self, BridgeModel::Bin(_))
+    }
+
+    /// Returns the minimum python minor version supported
+    pub fn minimal_python_minor_version(&self) -> usize {
+        match self.pyo3() {
+            Some(bindings) => bindings.minimal_python_minor_version(),
+            None => MINIMUM_PYTHON_MINOR,
+        }
+    }
+
+    /// Returns the maximum python minor version supported
+    pub fn maximum_python_minor_version(&self) -> usize {
+        match self.pyo3() {
+            Some(bindings) => bindings.maximum_python_minor_version(),
+            None => MAXIMUM_PYTHON_MINOR,
+        }
+    }
+
+    /// Returns the minimum PyPy minor version supported
+    pub fn minimal_pypy_minor_version(&self) -> usize {
+        match self.pyo3() {
+            Some(bindings) => bindings.minimal_pypy_minor_version(),
+            None => MINIMUM_PYPY_MINOR,
+        }
+    }
+
+    /// Returns the maximum PyPy minor version supported
+    pub fn maximum_pypy_minor_version(&self) -> usize {
+        match self.pyo3() {
+            Some(bindings) => bindings.maximum_pypy_minor_version(),
+            None => MAXIMUM_PYPY_MINOR,
+        }
+    }
+
+    /// Returns `true` if the bridge model carries stable-ABI metadata (e.g. abi3).
+    ///
+    /// This is a project-level check — it does not consider whether a particular
+    /// interpreter meets the abi3 minimum version.  For per‑interpreter checks
+    /// use [`is_stable_abi_for_interpreter`](Self::is_stable_abi_for_interpreter).
+    pub fn has_stable_abi(&self) -> bool {
+        self.pyo3()
+            .and_then(|pyo3| pyo3.stable_abi.as_ref())
+            .is_some()
+    }
+
+    /// Check whether an abi3 or abi3t build should be enabled for a specific interpreter.
+    ///
+    /// Returns `true` only when the bridge model has stable abi support **and**
+    /// the given interpreter supports the stable ABI **and** meets the abi3
+    /// minimum version. Version‑specific fallback builds (e.g. Python 3.10 when
+    /// abi3 targets ≥ 3.11) return `false` so that `Py_LIMITED_API` is not
+    /// defined and interpreter‑specific linker names are used.
+    pub fn is_stable_abi_for_interpreter(&self, interpreter: &PythonInterpreter) -> bool {
+        self.stable_abi_for_interpreter(interpreter).is_some()
+    }
+
+    /// Return the stable ABI kind this bridge can use for a specific interpreter.
+    pub fn stable_abi_for_interpreter(&self, interpreter: &PythonInterpreter) -> Option<StableAbi> {
+        self.pyo3()?.stable_abi.filter(|stable_abi| {
+            interpreter.has_stable_api(stable_abi.kind)
+                && stable_abi
+                    .version
+                    .min_version()
+                    .is_none_or(|(major, minor)| {
+                        (interpreter.major as u8, interpreter.minor as u8) >= (major, minor)
+                    })
+        })
+    }
+
+    /// free-threaded Python support
+    pub fn supports_free_threaded(&self) -> bool {
+        match self {
+            BridgeModel::Bin(Some(bindings)) | BridgeModel::PyO3(bindings) => {
+                bindings.supports_free_threaded()
+            }
+            BridgeModel::Bin(None) => true,
+            BridgeModel::Cffi | BridgeModel::UniFfi => false,
+        }
+    }
+}
+
+impl fmt::Display for BridgeModel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BridgeModel::Bin(Some(bindings)) => write!(f, "{} bin", bindings.crate_name),
+            BridgeModel::Bin(None) => write!(f, "bin"),
+            BridgeModel::PyO3(bindings) => write!(f, "{}", bindings.crate_name),
+            BridgeModel::Cffi => write!(f, "cffi"),
+            BridgeModel::UniFfi => write!(f, "uniffi"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stable_abi_kind_display() {
+        assert_eq!(StableAbiKind::Abi3.to_string(), "abi3");
+        assert_eq!(StableAbiKind::Abi3t.to_string(), "abi3t");
+    }
+
+    #[test]
+    fn stable_abi_kind_wheel_tag() {
+        assert_eq!(
+            StableAbiKind::Abi3.wheel_tag(),
+            BTreeSet::from(["abi3".to_string()])
+        );
+        // abi3t wheels are also importable on abi3-capable interpreters, so the
+        // wheel declares both ABI tags.
+        assert_eq!(
+            StableAbiKind::Abi3t.wheel_tag(),
+            BTreeSet::from(["abi3".to_string(), "abi3t".to_string()])
+        );
+    }
+
+    #[test]
+    fn stable_abi_constructors() {
+        let abi3 = StableAbi::from_abi3_version(3, 9);
+        assert_eq!(abi3.kind, StableAbiKind::Abi3);
+        assert_eq!(abi3.version, StableAbiVersion::Version(3, 9));
+
+        let abi3t = StableAbi::from_abi3t_version(3, 15);
+        assert_eq!(abi3t.kind, StableAbiKind::Abi3t);
+        assert_eq!(abi3t.version, StableAbiVersion::Version(3, 15));
+    }
+
+    #[test]
+    fn bindings_spellings_roundtrip() {
+        // The exact accepted spellings, in the historical order. These are a
+        // public contract (CLI values, `[tool.maturin] bindings`, JSON schema)
+        // and are not something the type can guarantee: only pinning the
+        // literals catches an accidental edit to `as_str`. Hardcoded here (not
+        // derived from `as_str`/`VARIANTS`) so the round-trip is meaningful.
+        let spellings = [
+            (Bindings::PyO3, "pyo3"),
+            (Bindings::PyO3Ffi, "pyo3-ffi"),
+            (Bindings::Cffi, "cffi"),
+            (Bindings::UniFfi, "uniffi"),
+            (Bindings::Bin, "bin"),
+        ];
+        for (binding, spelling) in spellings {
+            assert_eq!(binding.as_str(), spelling);
+            assert_eq!(spelling.parse::<Bindings>().unwrap(), binding);
+        }
+        assert_eq!(Bindings::VARIANTS, spellings.map(|(_, spelling)| spelling));
+    }
+
+    #[test]
+    fn bindings_fromstr_rejects_unknown() {
+        let err = "foo".parse::<Bindings>().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "unknown bindings type `foo`, expected one of pyo3, pyo3-ffi, cffi, uniffi, bin"
+        );
+    }
+}

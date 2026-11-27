@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:14.061317+00:00",
+  "name": "pyo3",
+  "repo": "PyO3/pyo3",
+  "branch": "main",
+  "license": "Apache-2.0",
+  "stars": 16389,
+  "commit_sha": "143012921bf66cb36e964a1e38b1292a4ed919d8",
+  "last_commit_date": "2026-11-27T12:55:44Z",
+  "files_count": 729,
+  "total_bytes": 5870985,
+  "output_dir": "./loot_kode/pyo3"
+}

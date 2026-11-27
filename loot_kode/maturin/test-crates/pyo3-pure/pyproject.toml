@@ -1,0 +1,49 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "pyo3"
+editable-profile = "dev"
+
+[tool.maturin.target."x86_64-apple-darwin"]
+macos-deployment-target = "10.12"
+
+[tool.maturin.target."aarch64-apple-darwin"]
+macos-deployment-target = "11.0"
+
+[project]
+# The name pyo3_pure instead of pyo3-pure is intentional,
+# it's used as a crate name resolution regression test
+name = "pyo3_pure"
+version = "0.1.0+abc123de"
+classifiers = [
+    "Programming Language :: Rust"
+]
+description = "Implements a dummy function in Rust"
+readme = "README.md"
+maintainers = [
+    {name = "messense", email = "messense@icloud.com"}
+]
+license = { file = "LICENSE" }
+dynamic = ["license"]  # Allow license from Cargo.toml to be used
+
+[project.optional-dependencies]
+test = [
+    "attrs",
+    "boltons; sys_platform == 'win32'"
+]
+
+[dependency-groups]
+dev = [
+    "attrs",
+]
+dev2 = [
+    "attrs",
+]
+
+[project.scripts]
+get_42 = "pyo3_pure:DummyClass.get_42"
+
+[project.gui-scripts]
+get_42_gui = "pyo3_pure:DummyClass.get_42"

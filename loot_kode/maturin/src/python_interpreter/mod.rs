@@ -1,0 +1,791 @@
+pub use self::config::InterpreterConfig;
+use crate::auditwheel::PlatformTag;
+use crate::bridge::{ABI3T_MINIMUM_PYTHON_MINOR, StableAbiKind};
+use crate::target::WheelTag;
+use crate::{StableAbi, Target};
+use anyhow::{Result, bail};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::ffi::OsStr;
+use std::fmt;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+mod abiflags;
+mod config;
+mod discovery;
+mod resolver;
+
+pub(crate) use self::discovery::python_command;
+pub(crate) use self::resolver::InterpreterResolver;
+
+/// Minimum supported CPython minor version.
+pub const MINIMUM_PYTHON_MINOR: usize = 7;
+/// Minimum supported PyPy minor version.
+pub const MINIMUM_PYPY_MINOR: usize = 8;
+/// Be liberal here to include preview versions
+pub const MAXIMUM_PYTHON_MINOR: usize = 15;
+/// Minimum supported version for free-threaded CPython
+pub const FREE_THREADED_MINIMUM_PYTHON_MINOR: usize = 14;
+/// Maximum supported PyPy minor version.
+pub const MAXIMUM_PYPY_MINOR: usize = 12;
+
+/// The kind of Python interpreter (CPython, PyPy, or GraalPy).
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, serde::Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+#[clap(rename_all = "lower")]
+pub enum InterpreterKind {
+    /// CPython — the reference Python implementation.
+    CPython,
+    /// PyPy — a fast, alternative Python implementation.
+    PyPy,
+    /// GraalPy — Python on GraalVM.
+    GraalPy,
+}
+
+impl InterpreterKind {
+    /// Is this a CPython interpreter?
+    pub fn is_cpython(&self) -> bool {
+        matches!(self, InterpreterKind::CPython)
+    }
+
+    /// Is this a PyPy interpreter?
+    pub fn is_pypy(&self) -> bool {
+        matches!(self, InterpreterKind::PyPy)
+    }
+
+    /// Is this a GraalPy interpreter?
+    pub fn is_graalpy(&self) -> bool {
+        matches!(self, InterpreterKind::GraalPy)
+    }
+}
+
+impl fmt::Display for InterpreterKind {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            InterpreterKind::CPython => write!(f, "CPython"),
+            InterpreterKind::PyPy => write!(f, "PyPy"),
+            InterpreterKind::GraalPy => write!(f, "GraalVM"),
+        }
+    }
+}
+
+impl FromStr for InterpreterKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "cpython" => Ok(InterpreterKind::CPython),
+            "pypy" => Ok(InterpreterKind::PyPy),
+            "graalvm" | "graalpy" => Ok(InterpreterKind::GraalPy),
+            unknown => Err(format!("Unknown interpreter kind '{unknown}'")),
+        }
+    }
+}
+
+/// The location and version of an interpreter
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct PythonInterpreter {
+    /// Python's sysconfig
+    /// Python's major version
+    pub config: InterpreterConfig,
+    /// Path to the python interpreter, e.g. /usr/bin/python3.6
+    ///
+    /// Just the name of the binary in PATH does also work, e.g. `python3.5`
+    pub executable: PathBuf,
+    /// Comes from `sysconfig.get_platform()`
+    ///
+    /// Note that this can be `None` when cross compiling
+    pub platform: Option<String>,
+    /// Is this interpreter runnable
+    ///
+    /// When cross compile the target interpreter isn't runnable,
+    /// and it's `executable` is empty
+    pub runnable: bool,
+    /// Comes from `sys.platform.name`
+    pub implementation_name: String,
+    /// Comes from sysconfig var `SOABI`
+    pub soabi: Option<String>,
+    /// Comes from sysconfig var `SOABI_PLATFORM` (Python 3.15+)
+    pub soabi_platform: Option<String>,
+    /// Comes from sysconfig var `LIBDIR`
+    ///
+    /// Only populated for runnable interpreters (including cross-compilation
+    /// venvs, such as the iOS cross-venvs used by cibuildwheel).
+    pub lib_dir: Option<String>,
+}
+
+impl Deref for PythonInterpreter {
+    type Target = InterpreterConfig;
+
+    fn deref(&self) -> &Self::Target {
+        &self.config
+    }
+}
+
+impl PythonInterpreter {
+    /// Does this interpreter have PEP 384 stable api aka. abi3 support?
+    pub fn has_abi3(&self) -> bool {
+        if self.implementation_name.parse::<InterpreterKind>().is_err() {
+            false
+        } else {
+            match self.interpreter_kind {
+                // Free-threaded python does not support abi3. All supported
+                // CPython GIL-enabled versions do support abi3
+                InterpreterKind::CPython => !self.config.gil_disabled,
+                InterpreterKind::PyPy | InterpreterKind::GraalPy => false,
+            }
+        }
+    }
+
+    /// Does this interpreter have PEP 803 stable api aka. abi3t support?
+    pub fn has_abi3t(&self) -> bool {
+        if self.implementation_name.parse::<InterpreterKind>().is_err() {
+            false
+        } else {
+            match self.interpreter_kind {
+                InterpreterKind::CPython => {
+                    self.config.major == 3
+                        && self.config.minor >= ABI3T_MINIMUM_PYTHON_MINOR as usize
+                }
+                InterpreterKind::PyPy | InterpreterKind::GraalPy => false,
+            }
+        }
+    }
+
+    /// Does this interpreter support either abi3 or abi3t?
+    pub fn has_stable_api(&self, kind: StableAbiKind) -> bool {
+        match kind {
+            StableAbiKind::Abi3 => self.has_abi3(),
+            StableAbiKind::Abi3t => self.has_abi3t(),
+        }
+    }
+
+    /// Generate PyO3 config file content for this interpreter.
+    ///
+    /// When maturin supplies `PYO3_CONFIG_FILE`, PyO3 does not live-probe the
+    /// interpreter. Use `platform` (from `sysconfig.get_platform()`) to preserve
+    /// the `libpython3` / `libpython3t` names PyO3's native MinGW discovery
+    /// would otherwise select.
+    pub(crate) fn pyo3_config_file_with_platform(
+        &self,
+        target: &Target,
+        stable_abi: Option<StableAbi>,
+        use_target_abi: bool,
+    ) -> String {
+        let mut content = self
+            .config
+            .pyo3_config_file(target, stable_abi, use_target_abi);
+        if target.is_windows()
+            && self.interpreter_kind == InterpreterKind::CPython
+            && self
+                .platform
+                .as_deref()
+                .is_some_and(|platform| platform.starts_with("mingw"))
+            && let Some(stable_abi) = stable_abi
+        {
+            let lib_name = match stable_abi.kind {
+                StableAbiKind::Abi3 => "libpython3",
+                StableAbiKind::Abi3t => "libpython3t",
+            };
+            content.push_str("\nlib_name=");
+            content.push_str(lib_name);
+        }
+        // pyo3 always links libpython on iOS. When maturin writes a config file
+        // (e.g. for stable ABI builds) pyo3 no longer queries the interpreter,
+        // so pass along the interpreter's LIBDIR (which contains
+        // `libpython3.X.dylib` in an iOS cross-venv) as the search path, unless
+        // the user has supplied one explicitly via `PYO3_CROSS_LIB_DIR`.
+        if target.is_ios()
+            && self.interpreter_kind == InterpreterKind::CPython
+            && std::env::var_os("PYO3_CROSS_LIB_DIR").is_none()
+            && let Some(lib_dir) = self.lib_dir.as_deref()
+        {
+            content.push_str("\nlib_dir=");
+            content.push_str(lib_dir);
+        }
+        content
+    }
+
+    /// Formats this interpreter as a value for uv's `--python` argument.
+    ///
+    /// A runnable interpreter is passed by path. Otherwise the interpreter
+    /// is passed as a version request for uv to resolve (e.g. if maturin
+    /// received `-i 3.10`, and no runnable interpreter was found, maturin
+    /// will pass `cpython@3.10` to uv).
+    pub fn as_uv_python_arg(&self) -> Cow<'_, OsStr> {
+        if self.runnable && !self.executable.as_os_str().is_empty() {
+            return self.executable.as_os_str().into();
+        }
+        let implementation = match self.interpreter_kind {
+            InterpreterKind::CPython => "cpython",
+            InterpreterKind::PyPy => "pypy",
+            InterpreterKind::GraalPy => "graalpy",
+        };
+        let mut request = format!(
+            "{implementation}@{major}.{minor}{abiflags}",
+            major = self.major,
+            minor = self.minor,
+            abiflags = self.abiflags,
+        );
+        // `3.14` might resolve to free-threaded python depending what is on the users'
+        // path (see https://github.com/astral-sh/uv/issues/16722), explicitly request `+gil` if needed
+        if self.interpreter_kind == InterpreterKind::CPython && !self.gil_disabled {
+            request.push_str("+gil");
+        }
+        Cow::Owned(request.into())
+    }
+
+    /// Returns the supported python environment in the PEP 425 format used for the wheel filename:
+    /// `{python tag}-{abi tag}-{platform tag}`.
+    ///
+    /// This is a **compatibility string helper** for external callers that need the tag as a
+    /// single string. New maturin code should prefer [`Self::get_wheel_tag`] and keep the
+    /// structured [`crate::WheelTag`] through to WHEEL metadata generation.
+    ///
+    /// If abi3 is true, cpython wheels use the generic abi3 with the given version as minimum.
+    pub fn get_tag(
+        &self,
+        project: &crate::ProjectContext,
+        platform_tags: &[PlatformTag],
+    ) -> Result<String> {
+        Ok(self.get_wheel_tag(project, platform_tags)?.to_string())
+    }
+
+    /// Structured PEP 425 wheel tag for this interpreter.
+    ///
+    /// Prefer this over [`Self::get_tag`] inside maturin so tags are not re-parsed from strings.
+    pub(crate) fn get_wheel_tag(
+        &self,
+        project: &crate::ProjectContext,
+        platform_tags: &[PlatformTag],
+    ) -> Result<WheelTag> {
+        // Restrict `sysconfig.get_platform()` usage to Windows and non-portable Linux only for now
+        // so we don't need to deal with macOS deployment target
+        let target = &project.target;
+        let use_sysconfig_platform = target.is_windows()
+            || (target.is_linux() && platform_tags.iter().any(|tag| !tag.is_portable()))
+            || target.is_illumos();
+        let platform = if use_sysconfig_platform {
+            if let Some(platform) = self.platform.clone() {
+                BTreeSet::from_iter([platform])
+            } else {
+                project.get_platform_tag(platform_tags)?
+            }
+        } else {
+            project.get_platform_tag(platform_tags)?
+        };
+        let tag = if self.implementation_name.parse::<InterpreterKind>().is_err() {
+            // Use generic tags when `sys.implementation.name` != `platform.python_implementation()`, for example Pyston
+            // See also https://github.com/pypa/packaging/blob/0031046f7fad649580bc3127d1cef9157da0dd79/packaging/tags.py#L234-L261
+            let interpreter = format!(
+                "{interpreter}{major}{minor}",
+                interpreter = self.implementation_name,
+                major = self.major,
+                minor = self.minor,
+            );
+            let abi = self
+                .soabi
+                .as_deref()
+                .unwrap_or("none")
+                .replace(['-', '.'], "_");
+            WheelTag::new([interpreter], [abi], platform)
+        } else {
+            match self.interpreter_kind {
+                InterpreterKind::CPython => {
+                    let interpreter =
+                        format!("cp{major}{minor}", major = self.major, minor = self.minor);
+                    let abi = format!(
+                        "cp{major}{minor}{abiflags}",
+                        major = self.major,
+                        minor = self.minor,
+                        abiflags = self.abiflags,
+                    );
+                    WheelTag::new([interpreter], [abi], platform)
+                }
+                InterpreterKind::PyPy => {
+                    // pypy uses its version as part of the ABI, e.g.
+                    // pypy 3.11 7.3 => numpy-1.20.1-pp311-pypy311_pp73-manylinux2014_x86_64.whl
+                    let interpreter =
+                        format!("pp{major}{minor}", major = self.major, minor = self.minor);
+                    let abi = abiflags::calculate_abi_tag(&self.ext_suffix)
+                        .expect("PyPy's syconfig didn't define a valid `EXT_SUFFIX` ಠ_ಠ");
+                    WheelTag::new([interpreter], [abi], platform)
+                }
+                InterpreterKind::GraalPy => {
+                    // GraalPy like PyPy uses its version as part of the ABI
+                    // graalpy 3.10 23.1 => numpy-1.23.5-graalpy310-graalpy231_310_native-manylinux2014_x86_64.whl
+                    let interpreter = format!(
+                        "graalpy{major}{minor}",
+                        major = self.major,
+                        minor = self.minor
+                    );
+                    let abi = abiflags::calculate_abi_tag(&self.ext_suffix)
+                        .expect("GraalPy's syconfig didn't define a valid `EXT_SUFFIX` ಠ_ಠ");
+                    WheelTag::new([interpreter], [abi], platform)
+                }
+            }
+        };
+        Ok(tag)
+    }
+
+    /// Adds the ext_suffix we read from python or know (.pyd/.abi3.so) and adds it to the base name
+    ///
+    /// For CPython, generate extensions as follows:
+    ///
+    /// For python 3, there is PEP 3149, but
+    /// that is only valid for 3.2 - 3.4. Since only 3.6+ is supported, the
+    /// templates are adapted from the (also
+    /// incorrect) release notes of CPython 3.5:
+    /// https://docs.python.org/3/whatsnew/3.5.html#build-and-c-api-changes
+    ///
+    /// Examples for 64-bit on CPython 3.6m:
+    /// Linux:   foobar.cpython-36m-x86_64-linux-gnu.so
+    /// Windows: foobar.cp36-win_amd64.pyd
+    /// Mac:     foobar.cpython-36m-darwin.so
+    /// FreeBSD: foobar.cpython-36m.so
+    ///
+    /// For pypy3, we read importlib.machinery.EXTENSION_SUFFIXES[0].
+    pub fn get_library_name(&self, base: &str) -> String {
+        format!(
+            "{base}{ext_suffix}",
+            base = base,
+            ext_suffix = self.ext_suffix
+        )
+    }
+
+    /// Is this a debug build of Python for Windows?
+    pub fn is_windows_debug(&self) -> bool {
+        self.ext_suffix.starts_with("_d.") && self.ext_suffix.ends_with(".pyd")
+    }
+
+    /// Construct a `PythonInterpreter` from a sysconfig and target
+    pub fn from_config(config: InterpreterConfig) -> Self {
+        let implementation_name = config.interpreter_kind.to_string().to_ascii_lowercase();
+        PythonInterpreter {
+            config,
+            executable: PathBuf::new(),
+            platform: None,
+            runnable: false,
+            implementation_name,
+            soabi: None,
+            soabi_platform: None,
+            lib_dir: None,
+        }
+    }
+
+    /// Create a non-runnable placeholder interpreter.
+    ///
+    /// Used for abi3 builds when no real interpreter is available. The
+    /// placeholder carries just enough metadata (major/minor version,
+    /// ext_suffix) for wheel tagging to work.
+    pub(crate) fn placeholder(major: usize, minor: usize, target: &Target) -> Self {
+        PythonInterpreter {
+            config: InterpreterConfig {
+                major,
+                minor,
+                interpreter_kind: InterpreterKind::CPython,
+                abiflags: String::new(),
+                ext_suffix: if target.is_windows() {
+                    ".pyd".to_string()
+                } else {
+                    String::new()
+                },
+                pointer_width: None,
+                gil_disabled: false,
+            },
+            executable: PathBuf::new(),
+            platform: None,
+            runnable: false,
+            implementation_name: "cpython".to_string(),
+            soabi: None,
+            soabi_platform: None,
+            lib_dir: None,
+        }
+    }
+
+    /// Checks whether the given command is a python interpreter and returns a
+    /// [`PythonInterpreter`] if that is the case.
+    ///
+    /// The `bridge` parameter is used to skip the platform-system mismatch
+    /// check for cffi bindings.
+    pub fn check_executable(
+        executable: impl AsRef<std::path::Path>,
+        target: &Target,
+        bridge: &crate::BridgeModel,
+    ) -> Result<Option<Self>> {
+        discovery::check_executable(executable, target, bridge)
+    }
+
+    /// Checks that given list of executables are all valid python interpreters,
+    /// determines the abiflags and versions of those interpreters and
+    /// returns them as [`PythonInterpreter`]s.
+    pub fn check_executables(
+        executables: &[PathBuf],
+        target: &Target,
+        bridge: &crate::BridgeModel,
+    ) -> Result<Vec<Self>> {
+        discovery::check_executables(executables, target, bridge)
+    }
+
+    /// Tries to find all installed python versions using the heuristic for the
+    /// given platform.
+    pub fn find_all(
+        target: &Target,
+        bridge: &crate::BridgeModel,
+        requires_python: Option<&pep440_rs::VersionSpecifiers>,
+    ) -> Result<Vec<Self>> {
+        discovery::find_all(target, bridge, requires_python)
+    }
+
+    /// Look up Python interpreters for a given target from maturin's bundled
+    /// sysconfig data.
+    ///
+    /// This does **not** discover interpreters on disk — it returns non-runnable
+    /// `PythonInterpreter` values constructed from bundled sysconfig metadata.
+    pub fn lookup_target(
+        target: &Target,
+        requires_python: Option<&pep440_rs::VersionSpecifiers>,
+        bridge: Option<&crate::BridgeModel>,
+    ) -> Vec<Self> {
+        discovery::lookup_target(target, requires_python, bridge)
+    }
+
+    /// Run a python script using this Python interpreter.
+    pub fn run_script(&self, script: &str) -> Result<String> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        if !self.runnable {
+            bail!("This {} isn't runnable", self);
+        }
+        let out = Command::new(&self.executable)
+            .env("PYTHONIOENCODING", "utf-8")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .and_then(|mut child| {
+                child
+                    .stdin
+                    .as_mut()
+                    .expect("piped stdin")
+                    .write_all(script.as_bytes())?;
+                child.wait_with_output()
+            });
+
+        match out {
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    bail!(
+                        "Could not find any interpreter at {}, \
+                         are you sure you have Python installed on your PATH?",
+                        self.executable.display()
+                    );
+                } else {
+                    bail!(
+                        "Failed to run the Python interpreter at {}: {}",
+                        self.executable.display(),
+                        err
+                    );
+                }
+            }
+            Ok(ok) if !ok.status.success() => bail!("Python script failed"),
+            Ok(ok) => Ok(String::from_utf8(ok.stdout)?),
+        }
+    }
+
+    /// Whether this Python interpreter support portable manylinux/musllinux wheels
+    ///
+    /// Returns `true` if we can not decide
+    pub fn support_portable_wheels(&self) -> bool {
+        if !self.runnable {
+            return true;
+        }
+        let out = std::process::Command::new(&self.executable)
+            .args([
+                "-m",
+                "pip",
+                "debug",
+                "--verbose",
+                "--disable-pip-version-check",
+            ])
+            .output();
+
+        match out {
+            Err(_) => true,
+            Ok(ok) if !ok.status.success() => true,
+            Ok(ok) => {
+                if let Ok(stdout) = String::from_utf8(ok.stdout) {
+                    stdout.contains("manylinux") || stdout.contains("musllinux")
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
+    /// An opaque fingerprint of this Python interpreter's version and ABI.
+    /// Used to trigger rebuilds for `pyo3` when the Python interpreter changes.
+    pub fn environment_signature(&self) -> String {
+        let pointer_width = self.pointer_width.unwrap_or(64);
+        format!(
+            "{}-{}.{}{}-{}bit",
+            self.implementation_name, self.major, self.minor, self.abiflags, pointer_width
+        )
+    }
+
+    /// Returns the site-packages directory inside a venv e.g.
+    /// {venv_base}/lib/python{x}.{y} on unix or {venv_base}/Lib on window
+    pub fn get_venv_site_package(&self, venv_base: impl AsRef<Path>, target: &Target) -> PathBuf {
+        if target.is_unix() {
+            match self.interpreter_kind {
+                InterpreterKind::CPython | InterpreterKind::GraalPy => {
+                    let python_dir = format!("python{}.{}", self.major, self.minor);
+                    venv_base
+                        .as_ref()
+                        .join("lib")
+                        .join(python_dir)
+                        .join("site-packages")
+                }
+                InterpreterKind::PyPy => venv_base.as_ref().join("site-packages"),
+            }
+        } else {
+            venv_base.as_ref().join("Lib").join("site-packages")
+        }
+    }
+}
+
+impl fmt::Display for PythonInterpreter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.runnable {
+            write!(
+                f,
+                "{} {}.{}{} at {}",
+                self.config.interpreter_kind,
+                self.config.major,
+                self.config.minor,
+                self.config.abiflags,
+                self.executable.display()
+            )
+        } else {
+            write!(
+                f,
+                "{} {}.{}{}",
+                self.config.interpreter_kind,
+                self.config.major,
+                self.config.minor,
+                self.config.abiflags,
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interpreter(
+        kind: InterpreterKind,
+        minor: usize,
+        abiflags: &str,
+        gil_disabled: bool,
+    ) -> PythonInterpreter {
+        PythonInterpreter {
+            config: InterpreterConfig {
+                major: 3,
+                minor,
+                interpreter_kind: kind,
+                abiflags: abiflags.to_string(),
+                ext_suffix: String::new(),
+                pointer_width: None,
+                gil_disabled,
+            },
+            executable: PathBuf::new(),
+            platform: None,
+            runnable: false,
+            implementation_name: kind.to_string().to_ascii_lowercase(),
+            soabi: None,
+            soabi_platform: None,
+            lib_dir: None,
+        }
+    }
+
+    fn windows_interpreter(
+        platform: &str,
+        minor: usize,
+        abiflags: &str,
+        gil_disabled: bool,
+    ) -> PythonInterpreter {
+        let mut interpreter = interpreter(InterpreterKind::CPython, minor, abiflags, gil_disabled);
+        // Keep EXT_SUFFIX and SOABI identical so sysconfig.get_platform() is
+        // the only source of MinGW identity exercised by these tests.
+        interpreter.config.ext_suffix = ".pyd".to_string();
+        interpreter.platform = Some(platform.to_string());
+        interpreter
+    }
+
+    #[test]
+    fn pyo3_config_file_windows_mingw_abi3_lib_name() {
+        let target = Target::from_resolved_target_triple("x86_64-pc-windows-gnu").unwrap();
+        let interpreter = windows_interpreter("mingw_x86_64_msvcrt_gnu", 14, "", false);
+
+        let config_file = interpreter.pyo3_config_file_with_platform(
+            &target,
+            Some(StableAbi::from_abi3_version(3, 10)),
+            true,
+        );
+
+        assert!(
+            config_file
+                .lines()
+                .any(|line| line == "lib_name=libpython3"),
+            "MinGW abi3 config did not select libpython3:\n{config_file}"
+        );
+    }
+
+    #[test]
+    fn pyo3_config_file_windows_mingw_abi3t_lib_name() {
+        let target = Target::from_resolved_target_triple("x86_64-pc-windows-gnu").unwrap();
+        let interpreter = windows_interpreter("mingw_x86_64_msvcrt_gnu", 15, "t", true);
+
+        let config_file = interpreter.pyo3_config_file_with_platform(
+            &target,
+            Some(StableAbi::from_abi3t_version(3, 15)),
+            true,
+        );
+
+        assert!(
+            config_file
+                .lines()
+                .any(|line| line == "lib_name=libpython3t"),
+            "MinGW abi3t config did not select libpython3t:\n{config_file}"
+        );
+    }
+
+    #[test]
+    fn pyo3_config_file_windows_non_mingw_control() {
+        let target = Target::from_resolved_target_triple("x86_64-pc-windows-gnu").unwrap();
+        let interpreter = windows_interpreter("win_amd64", 14, "", false);
+
+        let config_file = interpreter.pyo3_config_file_with_platform(
+            &target,
+            Some(StableAbi::from_abi3_version(3, 10)),
+            true,
+        );
+
+        assert!(
+            !config_file
+                .lines()
+                .any(|line| line.starts_with("lib_name=")),
+            "non-MinGW Windows config unexpectedly selected a library name:\n{config_file}"
+        );
+    }
+
+    #[test]
+    fn pyo3_config_file_ios_abi3_lib_dir() {
+        // Mirrors an iOS cross-venv created by cibuildwheel: the interpreter is
+        // runnable and reports a LIBDIR containing `libpython3.13.dylib`.
+        let target = Target::from_resolved_target_triple("aarch64-apple-ios-sim").unwrap();
+        let mut interpreter = interpreter(InterpreterKind::CPython, 13, "", false);
+        interpreter.runnable = true;
+        interpreter.lib_dir = Some("/path/to/Python.xcframework/ios-arm64-simulator/lib".into());
+
+        let config_file = interpreter.pyo3_config_file_with_platform(
+            &target,
+            Some(StableAbi::from_abi3_version(3, 9)),
+            true,
+        );
+
+        let lines: Vec<&str> = config_file.lines().collect();
+        assert!(
+            lines.contains(&"lib_name=python3.13"),
+            "iOS abi3 config did not link the interpreter's libpython:\n{config_file}"
+        );
+        assert!(
+            lines.contains(&"lib_dir=/path/to/Python.xcframework/ios-arm64-simulator/lib"),
+            "iOS abi3 config did not include the interpreter's LIBDIR:\n{config_file}"
+        );
+    }
+
+    #[test]
+    fn pyo3_config_file_non_ios_omits_interpreter_lib_dir() {
+        // Linux extension modules don't link libpython, so the interpreter's
+        // LIBDIR must not leak into the config file.
+        let target = Target::from_resolved_target_triple("x86_64-unknown-linux-gnu").unwrap();
+        let mut interpreter = interpreter(InterpreterKind::CPython, 13, "", false);
+        interpreter.runnable = true;
+        interpreter.lib_dir = Some("/usr/lib".into());
+
+        let config_file = interpreter.pyo3_config_file_with_platform(
+            &target,
+            Some(StableAbi::from_abi3_version(3, 9)),
+            true,
+        );
+
+        assert!(
+            !config_file.lines().any(|line| line.starts_with("lib_dir=")),
+            "non-iOS config unexpectedly included a lib_dir:\n{config_file}"
+        );
+    }
+
+    #[test]
+    fn environment_signature_includes_abiflags() {
+        for flags in ["", "d", "t", "td"] {
+            let interp = interpreter(InterpreterKind::CPython, 14, flags, flags.contains('t'));
+            assert_eq!(
+                interp.environment_signature(),
+                format!("cpython-3.14{flags}-64bit")
+            );
+        }
+    }
+
+    #[test]
+    fn uv_python_arg_runnable_uses_executable() {
+        let mut interp = interpreter(InterpreterKind::CPython, 10, "", false);
+        interp.executable = PathBuf::from("/usr/bin/python3.10");
+        interp.runnable = true;
+        assert_eq!(
+            interp.as_uv_python_arg(),
+            Cow::Borrowed(OsStr::new("/usr/bin/python3.10"))
+        );
+    }
+
+    #[test]
+    fn uv_python_arg_runnable_but_empty_executable_falls_back() {
+        let mut interp = interpreter(InterpreterKind::CPython, 10, "", false);
+        interp.runnable = true;
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("cpython@3.10+gil"));
+    }
+
+    #[test]
+    fn uv_python_arg_cpython_requests_gil() {
+        let interp = interpreter(InterpreterKind::CPython, 14, "", false);
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("cpython@3.14+gil"));
+    }
+
+    #[test]
+    fn uv_python_arg_free_threaded_uses_abiflags() {
+        let interp = interpreter(InterpreterKind::CPython, 14, "t", true);
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("cpython@3.14t"));
+    }
+
+    #[test]
+    fn uv_python_arg_debug_keeps_abiflags_and_gil() {
+        let interp = interpreter(InterpreterKind::CPython, 13, "d", false);
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("cpython@3.13d+gil"));
+    }
+
+    #[test]
+    fn uv_python_arg_pypy_omits_gil() {
+        let interp = interpreter(InterpreterKind::PyPy, 10, "", false);
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("pypy@3.10"));
+    }
+
+    #[test]
+    fn uv_python_arg_graalpy_omits_gil() {
+        let interp = interpreter(InterpreterKind::GraalPy, 11, "", false);
+        assert_eq!(interp.as_uv_python_arg(), OsStr::new("graalpy@3.11"));
+    }
+}

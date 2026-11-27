@@ -1,0 +1,975 @@
+use anyhow::{Context, Result};
+use clap::Parser;
+use expect_test::Expect;
+use flate2::read::GzDecoder;
+use fs_err::File;
+use maturin::pyproject_toml::{SdistGenerator, ToolMaturin};
+use maturin::{
+    BuildOptions, BuildOrchestrator, CargoOptions, OutputOptions, PlatformOptions, PlatformTag,
+    PythonOptions, unpack_sdist,
+};
+use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use tar::Archive;
+use time::PrimitiveDateTime;
+use walkdir::WalkDir;
+use zip::ZipArchive;
+
+pub fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs_err::create_dir_all(dst)?;
+    for entry in fs_err::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip build artifacts and caches
+        if name_str == "target"
+            || name_str == "__pycache__"
+            || name_str.ends_with(".pyc")
+            || name_str.ends_with(".pyd")
+            || name_str.ends_with(".so")
+            || name_str.ends_with(".dll")
+            || name_str.ends_with(".dylib")
+            || name_str.ends_with(".dSYM")
+        {
+            continue;
+        }
+        let src_path = entry.path();
+        let dst_path = dst.join(name);
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            fs_err::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Tries to compile a sample crate (pyo3-pure) for musl,
+/// given that rustup and the the musl target are installed
+///
+/// The bool in the Ok() response says whether the test was actually run
+pub fn test_musl() -> Result<bool> {
+    use anyhow::bail;
+    use fs_err as fs;
+    use fs_err::File;
+    use goblin::elf::Elf;
+    use std::io::ErrorKind;
+    use std::process::Command;
+
+    let get_target_list = Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output();
+
+    match get_target_list {
+        Ok(output) => {
+            if output.status.success() {
+                let has_musl = String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line.trim() == "x86_64-unknown-linux-musl");
+                if !has_musl {
+                    return Ok(false);
+                }
+            } else {
+                bail!(
+                    "`rustup target list --installed` failed with status {}",
+                    output.status
+                )
+            }
+        }
+        // Ignore installations without rustup
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err.into()),
+    };
+
+    // The first arg gets ignored
+    let options: BuildOptions = BuildOptions::try_parse_from([
+        "build",
+        "--manifest-path",
+        "test-crates/hello-world/Cargo.toml",
+        "--interpreter",
+        "python3",
+        "--target",
+        "x86_64-unknown-linux-musl",
+        "--compatibility",
+        "linux",
+        "--quiet",
+        "--target-dir",
+        "test-crates/targets/test_musl",
+        "--out",
+        "test-crates/wheels/test_musl",
+    ])?;
+
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let built_lib =
+        PathBuf::from("test-crates/targets/test_musl/x86_64-unknown-linux-musl/debug/hello-world");
+    if built_lib.is_file() {
+        fs::remove_file(&built_lib)?;
+    }
+    let wheels = BuildOrchestrator::new(&build_context).build_wheels()?;
+    assert_eq!(wheels.len(), 1);
+
+    // Ensure that we've actually built for musl
+    assert!(built_lib.is_file());
+    let mut file = File::open(built_lib)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
+    let elf = Elf::parse(&buffer)?;
+    assert_eq!(elf.libraries, Vec::<&str>::new());
+
+    Ok(true)
+}
+
+/// Test that we ignore non-existent Cargo.lock file listed by `cargo package --list`,
+/// which seems to only occur with workspaces.
+/// See https://github.com/rust-lang/cargo/issues/7938#issuecomment-593280660 and
+/// https://github.com/PyO3/maturin/issues/449
+pub fn test_workspace_cargo_lock() -> Result<()> {
+    // The first arg gets ignored
+    let options: BuildOptions = BuildOptions::try_parse_from([
+        "build",
+        "--manifest-path",
+        "test-crates/workspace/py/Cargo.toml",
+        "--compatibility",
+        "linux",
+        "--quiet",
+        "--target-dir",
+        "test-crates/targets/test_workspace_cargo_lock",
+        "--out",
+        "test-crates/wheels/test_workspace_cargo_lock",
+    ])?;
+
+    let build_context = options
+        .into_build_context()
+        .strip(Some(false))
+        .editable(false)
+        .build()?;
+    let source_distribution = BuildOrchestrator::new(&build_context).build_source_distribution()?;
+    assert!(source_distribution.is_some());
+
+    Ok(())
+}
+
+pub fn build_source_distribution(
+    package: impl AsRef<Path>,
+    sdist_generator: SdistGenerator,
+    unique_name: &str,
+) -> Result<Archive<GzDecoder<File>>> {
+    let target_dir = crate::common::case_target_dir(unique_name);
+    build_source_distribution_with_target_dir(package, sdist_generator, target_dir, unique_name)
+}
+
+fn build_source_distribution_with_target_dir(
+    package: impl AsRef<Path>,
+    sdist_generator: SdistGenerator,
+    target_dir: PathBuf,
+    unique_name: &str,
+) -> Result<Archive<GzDecoder<File>>> {
+    let manifest_path = package.as_ref().join("Cargo.toml");
+    let sdist_directory = crate::common::case_wheel_dir(unique_name);
+
+    let build_options = BuildOptions {
+        output: OutputOptions {
+            out: Some(sdist_directory),
+            ..Default::default()
+        },
+        cargo: CargoOptions {
+            manifest_path: Some(manifest_path),
+            quiet: true,
+            target_dir: Some(target_dir),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let mut build_context = build_options
+        .into_build_context()
+        .strip(Some(false))
+        .editable(false)
+        .sdist_only(true)
+        .build()?;
+
+    // Override the sdist generator for testing
+    let mut pyproject_toml = build_context.project.pyproject_toml.take().unwrap();
+    let mut tool = pyproject_toml.tool.clone().unwrap_or_default();
+    if let Some(ref mut tool_maturin) = tool.maturin {
+        tool_maturin.sdist_generator = sdist_generator;
+    } else {
+        tool.maturin = Some(ToolMaturin {
+            sdist_generator,
+            ..Default::default()
+        });
+    }
+    pyproject_toml.tool = Some(tool);
+    build_context.project.pyproject_toml = Some(pyproject_toml);
+
+    let sdist = BuildOrchestrator::new(&build_context)
+        .build_source_distribution()?
+        .context("Failed to build source distribution")?;
+
+    let tar_gz = fs_err::File::open(sdist.path)?;
+    let tar = GzDecoder::new(tar_gz);
+    let archive = Archive::new(tar);
+    Ok(archive)
+}
+
+pub fn test_source_distribution(
+    package: impl AsRef<Path>,
+    sdist_generator: SdistGenerator,
+    expected_files: Expect,
+    expected_cargo_toml: Option<(&Path, Expect)>,
+    unique_name: &str,
+) -> Result<()> {
+    let mut archive = build_source_distribution(package, sdist_generator, unique_name)?;
+    let mut files = BTreeSet::new();
+    let mut file_count = 0;
+    let mut cargo_toml = None;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        files.insert(format!("{}", entry.path()?.display()));
+        file_count += 1;
+        if let Some(cargo_toml_path) = expected_cargo_toml.as_ref().map(|(p, _)| *p)
+            && entry.path()? == cargo_toml_path
+        {
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents)?;
+            cargo_toml = Some(contents);
+        }
+    }
+    expected_files.assert_debug_eq(&files);
+    assert_eq!(
+        file_count,
+        files.len(),
+        "duplicated files found in sdist: {:?}",
+        files
+    );
+
+    if let Some((cargo_toml_path, expected)) = expected_cargo_toml {
+        let cargo_toml = cargo_toml
+            .with_context(|| format!("{} not found in sdist", cargo_toml_path.display()))?;
+        expected.assert_eq(&cargo_toml.replace("\r\n", "\n"));
+    }
+    Ok(())
+}
+
+pub fn check_sdist_mtimes(
+    package: impl AsRef<Path>,
+    expected_mtime: u64,
+    unique_name: &str,
+) -> Result<()> {
+    let mut archive = build_source_distribution(package, SdistGenerator::Cargo, unique_name)?;
+
+    for entry in archive.entries()? {
+        let entry = entry?;
+        let filename = entry.header().path()?;
+        let mtime = entry.header().mtime()?;
+
+        assert_eq!(
+            mtime,
+            expected_mtime,
+            "File {} has an mtime of {} instead of {}",
+            filename.display(),
+            mtime,
+            expected_mtime
+        );
+    }
+
+    Ok(())
+}
+
+fn build_wheel_files(package: impl AsRef<Path>, unique_name: &str) -> Result<ZipArchive<File>> {
+    let target_dir = crate::common::shared_target_dir(&package);
+    let _fixture_lock = crate::common::lock_fixture(&package)?;
+    build_wheel_files_with_target_dir(package, target_dir, unique_name)
+}
+
+fn build_wheel_files_with_target_dir(
+    package: impl AsRef<Path>,
+    target_dir: PathBuf,
+    unique_name: &str,
+) -> Result<ZipArchive<File>> {
+    let manifest_path = package.as_ref().join("Cargo.toml");
+    let wheel_directory = Path::new("test-crates").join("wheels").join(unique_name);
+
+    let build_options = BuildOptions {
+        output: OutputOptions {
+            out: Some(wheel_directory),
+            ..Default::default()
+        },
+        cargo: CargoOptions {
+            manifest_path: Some(manifest_path),
+            quiet: true,
+            target_dir: Some(target_dir),
+            ..Default::default()
+        },
+        platform: PlatformOptions {
+            platform_tag: vec![PlatformTag::Linux.into()],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let build_context = build_options
+        .into_build_context()
+        .strip(Some(false))
+        .editable(false)
+        .build()?;
+    let wheels = BuildOrchestrator::new(&build_context)
+        .build_wheels()
+        .context("Failed to build wheels")?;
+    assert!(!wheels.is_empty());
+    let wheel_path = &wheels[0].path;
+
+    let wheel = ZipArchive::new(File::open(wheel_path)?)?;
+    Ok(wheel)
+}
+
+pub fn check_wheel_mtimes(
+    package: impl AsRef<Path>,
+    expected_mtime: Vec<PrimitiveDateTime>,
+    unique_name: &str,
+) -> Result<()> {
+    let mut wheel = build_wheel_files(package, unique_name)?;
+    let mut mtimes = BTreeSet::<PrimitiveDateTime>::new();
+
+    for idx in 0..wheel.len() {
+        let mtime = wheel.by_index(idx)?.last_modified().unwrap().try_into()?;
+        mtimes.insert(mtime);
+    }
+
+    assert_eq!(mtimes, expected_mtime.into_iter().collect::<BTreeSet<_>>());
+
+    Ok(())
+}
+
+pub fn check_wheel_paths(
+    package: impl AsRef<Path>,
+    record_file: &str,
+    unique_name: &str,
+) -> Result<()> {
+    let mut wheel = build_wheel_files(package, unique_name)?;
+    let mut f = wheel.by_path(record_file)?;
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    assert!(!s.contains("\\"));
+    Ok(())
+}
+
+pub fn check_wheel_files(
+    package: impl AsRef<Path>,
+    expected_files: Vec<&str>,
+    unique_name: &str,
+) -> Result<()> {
+    assert_eq!(
+        wheel_files(package, unique_name)?,
+        expected_files
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+    Ok(())
+}
+
+pub fn wheel_files(package: impl AsRef<Path>, unique_name: &str) -> Result<BTreeSet<String>> {
+    let wheel = build_wheel_files(package, unique_name)?;
+    let drop_platform_specific_files = |file: &std::borrow::Cow<'_, str>| -> bool {
+        !matches!(Path::new(file.as_ref()).extension(), Some(ext) if ext == "pyc" || ext == "pyd" || ext == "so" || ext == "pdb" || ext == "dwp")
+            && !file.contains(".dSYM/")
+    };
+    Ok(wheel
+        .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .filter(drop_platform_specific_files)
+        .map(|name| name.into_owned())
+        .collect::<BTreeSet<_>>())
+}
+
+#[cfg(feature = "sbom")]
+pub fn check_wheel_files_with_sbom(package: impl AsRef<Path>, unique_name: &str) -> Result<()> {
+    let wheel = build_wheel_files(&package, unique_name)?;
+
+    let sbom_files: Vec<String> = wheel
+        .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|f| f.contains(".dist-info/sboms/"))
+        .map(|f| f.to_string())
+        .collect();
+    assert!(
+        !sbom_files.is_empty(),
+        "Expected SBOM files in the wheel, but found none. Wheel contents: {:?}",
+        wheel.file_names().collect::<Vec<_>>()
+    );
+    for sbom_file in &sbom_files {
+        assert!(
+            sbom_file.ends_with(".cyclonedx.json"),
+            "Expected SBOM file to have .cyclonedx.json extension, got: {sbom_file}"
+        );
+    }
+
+    Ok(())
+}
+
+pub fn abi3_python_interpreter_args() -> Result<()> {
+    // Case 1: maturin build without `-i`, should work
+    let options = BuildOptions::try_parse_from(vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-pure/Cargo.toml",
+        "--quiet",
+    ])?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+    assert!(result.is_ok());
+
+    // Case 2: maturin build -i python3.10, should work because python3.10 is in bundled sysconfigs
+    let options = BuildOptions::try_parse_from(vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-pure/Cargo.toml",
+        "--quiet",
+        "-i",
+        "python3.10",
+    ])?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+    assert!(result.is_ok());
+
+    // Windows is a bit different so we exclude it from case 3 & 4
+
+    // Case 3: maturin build -i python2.7, errors because python2.7 is supported
+    #[cfg(not(windows))]
+    {
+        let options = BuildOptions::try_parse_from(vec![
+            "build",
+            "--manifest-path",
+            "test-crates/pyo3-pure/Cargo.toml",
+            "--quiet",
+            "-i",
+            "python2.7",
+        ])?;
+        let result = options
+            .into_build_context()
+            .strip(crate::common::TEST_STRIP)
+            .editable(false)
+            .build();
+        assert!(result.is_err());
+
+        // Case 4: maturin build -i python-does-not-exists, errors because python executable is not found
+        let options = BuildOptions::try_parse_from(vec![
+            "build",
+            "--manifest-path",
+            "test-crates/pyo3-pure/Cargo.toml",
+            "--quiet",
+            "-i",
+            "python-does-not-exists",
+        ])?;
+        let result = options
+            .into_build_context()
+            .strip(crate::common::TEST_STRIP)
+            .editable(false)
+            .build();
+        assert!(result.is_err());
+    }
+
+    Ok(())
+}
+
+pub fn abi3_without_version() -> Result<()> {
+    let python = crate::common::test_python_path().unwrap_or_else(|| "python3".to_string());
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-abi3-without-version/Cargo.toml",
+        "--quiet",
+        "--interpreter",
+        python.as_str(),
+        "--target-dir",
+        "test-targets/wheels/abi3_without_version",
+    ];
+
+    let options = BuildOptions::try_parse_from(cli)?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+    assert!(result.is_ok());
+
+    Ok(())
+}
+
+pub fn pyo3_cffi_build_script() -> Result<()> {
+    let base = crate::common::test_python_path().map(PathBuf::from);
+    let venv_dir = crate::common::create_named_virtualenv("pyo3-cffi-build-script", base)?;
+    let venv_python = maturin::Target::from_target_triple(None)?.get_venv_python(&venv_dir);
+    crate::common::install_pip_packages(&venv_python, &["cffi"])?;
+    let python = venv_python
+        .to_str()
+        .context("venv python path is not utf-8")?;
+
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-cffi-build-script/Cargo.toml",
+        "--quiet",
+        "--interpreter",
+        python,
+        "--target-dir",
+        "test-targets/wheels/pyo3_cffi_build_script",
+    ];
+
+    let options = BuildOptions::try_parse_from(cli)?;
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    // Actually build the wheel so the crate's build.rs runs.
+    let wheels = BuildOrchestrator::new(&build_context).build_wheels();
+    assert!(wheels.is_ok());
+
+    Ok(())
+}
+
+pub fn abi3t_without_version() -> Result<()> {
+    let python = crate::common::test_python_path().unwrap_or_else(|| "python3".to_string());
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-abi3t-without-version/Cargo.toml",
+        "--quiet",
+        "--interpreter",
+        python.as_str(),
+        "--target-dir",
+        "test-targets/wheels/abi3t_without_version",
+    ];
+
+    let options = BuildOptions::try_parse_from(cli)?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+    assert!(result.is_ok());
+
+    Ok(())
+}
+
+fn expected_combined_stable_abi_tags(
+    python_interpreter: &maturin::PythonInterpreter,
+) -> Option<&'static [&'static str]> {
+    if python_interpreter.implementation_name != "cpython" {
+        return None;
+    }
+    match (
+        python_interpreter.major,
+        python_interpreter.minor,
+        python_interpreter.gil_disabled,
+    ) {
+        (3, 8..=14, false) => Some(&["cp38-abi3"]),
+        (3, 14, true) => Some(&["cp314-cp314t"]),
+        (3, 15, false) => Some(&["cp315-abi3.abi3t"]),
+        (3, 15, true) => Some(&["cp315-abi3.abi3t"]),
+        _ => None,
+    }
+}
+
+pub fn combined_stable_abi_wheel_selection(unique_name: &str, features: &[&str]) -> Result<()> {
+    let python = crate::common::test_python_path()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    let target_dir = crate::common::case_target_dir(unique_name);
+    let wheel_dir = crate::common::case_wheel_dir(unique_name);
+
+    let options = BuildOptions {
+        python: PythonOptions {
+            interpreter: vec![python],
+            ..Default::default()
+        },
+        output: OutputOptions {
+            out: Some(wheel_dir.clone()),
+            ..Default::default()
+        },
+        cargo: CargoOptions {
+            manifest_path: Some(Path::new("test-crates/pyo3-abi3-and-abi3t").join("Cargo.toml")),
+            quiet: true,
+            target_dir: Some(target_dir.clone()),
+            features: features.iter().map(|feature| feature.to_string()).collect(),
+            no_default_features: !features.is_empty(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let python_interpreter = build_context
+        .python
+        .interpreter
+        .first()
+        .context("no Python interpreter resolved")?;
+    let Some(expected) = expected_combined_stable_abi_tags(python_interpreter) else {
+        eprintln!("Skipping combined stable ABI wheel-selection test for {python_interpreter}");
+        return Ok(());
+    };
+
+    for dir in [&target_dir, &wheel_dir] {
+        if dir.is_dir() {
+            fs_err::remove_dir_all(dir)?;
+        }
+    }
+    let wheels = BuildOrchestrator::new(&build_context).build_wheels()?;
+
+    let actual = wheels
+        .iter()
+        .map(|wheel| {
+            let wheel_path = &wheel.path;
+            let filename = wheel_path.file_name().unwrap().to_str().unwrap();
+            let mut fields = filename.strip_suffix(".whl").unwrap().rsplit('-');
+            let _platform = fields.next().unwrap();
+            let abi = fields.next().unwrap();
+            let python = fields.next().unwrap();
+            format!("{python}-{abi}")
+        })
+        .collect::<BTreeSet<_>>();
+    let expected = expected.iter().copied().map(String::from).collect();
+    assert_eq!(actual, expected);
+
+    // Stable ABI extensions only include SOABI_PLATFORM when the minimum version is 3.15+,
+    // older Pythons don't accept such filenames.
+    if !cfg!(windows) {
+        for wheel in &wheels {
+            let filename = wheel.path.file_name().unwrap().to_str().unwrap();
+            let expected_suffix = if filename.contains("-cp38-abi3-") {
+                ".abi3.so".to_string()
+            } else if filename.contains("-cp315-abi3.abi3t-") {
+                match &python_interpreter.soabi_platform {
+                    Some(platform) => format!(".abi3t-{platform}.so"),
+                    None => ".abi3t.so".to_string(),
+                }
+            } else {
+                continue;
+            };
+            let archive = ZipArchive::new(File::open(&wheel.path)?)?;
+            let extensions: Vec<_> = archive
+                .file_names()
+                .collect::<zip::result::ZipResult<Vec<_>>>()?
+                .into_iter()
+                .filter(|name| name.ends_with(".so"))
+                .collect();
+            assert_eq!(
+                extensions,
+                [format!(
+                    "pyo3_abi3_and_abi3t/pyo3_abi3_and_abi3t{expected_suffix}"
+                )]
+            );
+        }
+    }
+
+    crate::common::cleanup_case(unique_name);
+    Ok(())
+}
+
+/// Test that builds succeed even when there are unreadable directories in the project root.
+///
+/// See https://github.com/PyO3/maturin/issues/2777
+#[cfg(unix)]
+pub fn test_unreadable_dir() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Root bypasses permission checks, so we can't test this as root.
+    if nix::unistd::getuid().is_root() {
+        return Ok(());
+    }
+
+    let temp_dir = tempfile::tempdir()?;
+    let project_dir = temp_dir.path().join("pyo3-mixed");
+    copy_dir_recursive(Path::new("test-crates/pyo3-mixed"), &project_dir)?;
+
+    // Create an unreadable dir that is not the python package.
+    let unreadable_dir = project_dir.join("unreadable_cache");
+    fs_err::create_dir(&unreadable_dir)?;
+    fs_err::write(unreadable_dir.join("cache_file"), "cached data")?;
+    fs_err::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000))?;
+    assert!(
+        fs_err::read_dir(&unreadable_dir).is_err(),
+        "Directory must be unreadable"
+    );
+
+    // Test source dist build. See also https://github.com/rust-lang/cargo/issues/16465
+    let sdist_options = BuildOptions::try_parse_from([
+        "build",
+        "--manifest-path",
+        project_dir.join("Cargo.toml").to_str().unwrap(),
+        "--quiet",
+        "--target-dir",
+        temp_dir.path().join("target").to_str().unwrap(),
+        "--out",
+        temp_dir.path().join("dist").to_str().unwrap(),
+    ])?;
+
+    let sdist_context = sdist_options
+        .into_build_context()
+        .strip(Some(false))
+        .editable(false)
+        .sdist_only(true)
+        .build()?;
+    BuildOrchestrator::new(&sdist_context).build_source_distribution()?;
+
+    // Test wheel build
+    let wheel_options = BuildOptions::try_parse_from([
+        "build",
+        "--manifest-path",
+        project_dir.join("Cargo.toml").to_str().unwrap(),
+        "--quiet",
+        "--target-dir",
+        temp_dir.path().join("target").to_str().unwrap(),
+        "--out",
+        temp_dir.path().join("dist").to_str().unwrap(),
+    ])?;
+
+    let wheel_context = wheel_options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let wheel_result = BuildOrchestrator::new(&wheel_context).build_wheels();
+
+    // Restore permissions before temp_dir cleanup
+    fs_err::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o755))?;
+
+    wheel_result?;
+    Ok(())
+}
+
+/// Test that target and cache directories in the python package aren't packaged outside of git.
+///
+/// See https://github.com/PyO3/maturin/issues/3319
+pub fn test_target_dir_in_python_package() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let project_dir = temp_dir.path().join("bin-with-python-module");
+    copy_dir_recursive(
+        Path::new("test-crates/bin-with-python-module"),
+        &project_dir,
+    )?;
+
+    // Like the default `target/wheels` output, creating it first keeps cargo from tagging it
+    let target_dir = project_dir.join("bin_with_python_module/target");
+    fs_err::create_dir_all(&target_dir)?;
+    let cache_dir = project_dir.join("bin_with_python_module/cache");
+    fs_err::create_dir_all(&cache_dir)?;
+    fs_err::write(
+        cache_dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )?;
+    // With the wrong signature, it's not a cache directory
+    let data_dir = project_dir.join("bin_with_python_module/data");
+    fs_err::create_dir_all(&data_dir)?;
+    fs_err::write(
+        data_dir.join("CACHEDIR.TAG"),
+        "Signature: ffffffffffffffffffffffffffffffff\n",
+    )?;
+    // The tag must be a regular file, not a symlink
+    #[cfg(unix)]
+    {
+        let symlink_dir = project_dir.join("bin_with_python_module/symlink");
+        fs_err::create_dir_all(&symlink_dir)?;
+        fs_err::os::unix::fs::symlink(
+            cache_dir.join("CACHEDIR.TAG"),
+            symlink_dir.join("CACHEDIR.TAG"),
+        )?;
+    }
+
+    let wheel = build_wheel_files_with_target_dir(
+        &project_dir,
+        target_dir,
+        "wheel-files-bin-with-python-module-target-dir",
+    )?;
+    let package_files: Vec<_> = wheel
+        .file_names()
+        .collect::<zip::result::ZipResult<Vec<_>>>()?
+        .into_iter()
+        .filter(|name| name.starts_with("bin_with_python_module/"))
+        .collect();
+    #[allow(unused_mut)]
+    let mut expected = vec![
+        "bin_with_python_module/__init__.py",
+        "bin_with_python_module/data/CACHEDIR.TAG",
+    ];
+    #[cfg(unix)]
+    expected.push("bin_with_python_module/symlink/CACHEDIR.TAG");
+    assert_eq!(package_files, expected);
+    Ok(())
+}
+
+/// Test that target and cache directories in the python package aren't packaged in sdists. The
+/// python package of pyo3-mixed-src is outside the crate, so `cargo package` doesn't list them.
+///
+/// See https://github.com/PyO3/maturin/issues/3319
+pub fn test_target_dir_in_python_package_sdist() -> Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let project_dir = temp_dir.path().join("pyo3-mixed-src");
+    copy_dir_recursive(Path::new("test-crates/pyo3-mixed-src"), &project_dir)?;
+
+    // Leftovers of an earlier build in a target directory that cargo didn't tag
+    let target_dir = project_dir.join("src/pyo3_mixed_src/target");
+    fs_err::create_dir_all(target_dir.join("debug"))?;
+    fs_err::write(target_dir.join("debug/libpyo3_mixed_src.rlib"), "")?;
+    let cache_dir = project_dir.join("src/pyo3_mixed_src/cache");
+    fs_err::create_dir_all(&cache_dir)?;
+    fs_err::write(
+        cache_dir.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55\n",
+    )?;
+
+    let mut sdist = build_source_distribution_with_target_dir(
+        project_dir.join("rust"),
+        SdistGenerator::Cargo,
+        target_dir,
+        "sdist-pyo3-mixed-src-target-dir",
+    )?;
+    let mut package_files = Vec::new();
+    for entry in sdist.entries()? {
+        let path = format!("{}", entry?.path()?.display());
+        if path.starts_with("pyo3_mixed_src-2.1.3/src/pyo3_mixed_src/") {
+            package_files.push(path);
+        }
+    }
+    assert_eq!(
+        package_files,
+        [
+            "pyo3_mixed_src-2.1.3/src/pyo3_mixed_src/__init__.py",
+            "pyo3_mixed_src-2.1.3/src/pyo3_mixed_src/python_module/__init__.py",
+            "pyo3_mixed_src-2.1.3/src/pyo3_mixed_src/python_module/double.py",
+        ]
+    );
+    Ok(())
+}
+
+/// Test that building wheels from an sdist works correctly.
+/// This simulates the `maturin build --sdist` workflow: build sdist first,
+/// unpack it, then build wheels from the unpacked sdist.
+pub fn test_build_wheels_from_sdist(package: impl AsRef<Path>) -> Result<()> {
+    let package = package.as_ref();
+    let temp_dir = tempfile::tempdir()?;
+    let sdist_dir = temp_dir.path().join("sdist");
+    let wheel_dir = temp_dir.path().join("wheels");
+
+    // Step 1: Build the sdist
+    let sdist_options = BuildOptions {
+        output: OutputOptions {
+            out: Some(sdist_dir),
+            ..Default::default()
+        },
+        cargo: CargoOptions {
+            manifest_path: Some(package.join("Cargo.toml")),
+            quiet: true,
+            target_dir: Some(crate::common::shared_target_dir(package)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sdist_context = sdist_options
+        .into_build_context()
+        .strip(Some(false))
+        .editable(false)
+        .sdist_only(true)
+        .build()?;
+    let sdist = BuildOrchestrator::new(&sdist_context)
+        .build_source_distribution()?
+        .context("Failed to build source distribution")?;
+
+    // Step 2: Unpack sdist and build wheels from it
+    let maturin::UnpackedSdist {
+        tmpdir: _tmp,
+        cargo_toml,
+        pyproject_toml,
+    } = unpack_sdist(&sdist.path)?;
+    let wheel_options = BuildOptions {
+        output: OutputOptions {
+            out: Some(wheel_dir),
+            ..Default::default()
+        },
+        cargo: CargoOptions {
+            manifest_path: Some(cargo_toml),
+            quiet: true,
+            // The unpacked sdist lives in a fresh temp dir each run, so only the dependency
+            // tree is reusable; share it with the package's family.
+            target_dir: Some(crate::common::shared_target_dir(package)),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let wheel_context = wheel_options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .pyproject_toml_path(Some(pyproject_toml))
+        .build()?;
+    // The unpacked crate has the same name as the fixture, so builds share cargo output paths.
+    let fixture_lock = crate::common::lock_fixture(package)?;
+    let wheels = BuildOrchestrator::new(&wheel_context).build_wheels()?;
+    drop(fixture_lock);
+    assert!(
+        !wheels.is_empty(),
+        "Expected at least one wheel to be built"
+    );
+
+    Ok(())
+}
+
+pub fn generate_stubs(package: impl AsRef<Path>, expected_files: &[&str]) -> Result<()> {
+    let package = package.as_ref();
+    let output_dir = tempfile::tempdir()?;
+    let fixture_lock = crate::common::lock_fixture(package)?;
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_maturin"))
+            .arg("generate-stubs")
+            .arg("-m")
+            .arg(package.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(crate::common::shared_target_dir(package))
+            .arg("--out")
+            .arg(output_dir.path())
+            .status()?
+            .success()
+    );
+    drop(fixture_lock);
+    let found_files = WalkDir::new(output_dir.path())
+        .sort_by_file_name()
+        .into_iter()
+        .filter(|e| match e {
+            Ok(e) => e.file_type().is_file(),
+            Err(_) => true,
+        })
+        .map(|e| {
+            Ok(e?
+                .path()
+                .strip_prefix(output_dir.path())?
+                .to_str()
+                .unwrap()
+                .replace('\\', "/"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(found_files, expected_files);
+    Ok(())
+}

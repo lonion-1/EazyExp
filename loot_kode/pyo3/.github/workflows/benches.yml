@@ -1,0 +1,61 @@
+name: benches
+
+on:
+  push:
+    branches:
+      - "main"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}-benches
+  cancel-in-progress: true
+
+env:
+  UV_LOCKED: 1
+  CARGO_TERM_COLOR: always
+  UV_PYTHON: "3.14t"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmarks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'CI-save-pr-cache') }}
+
+      # Using this action is still necessary for CodSpeed to build flamegraphs correctly,
+      # see note about setup-python in https://codspeed.io/docs/benchmarks/python#recipes
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ env.UV_PYTHON }}
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update --component rust-src
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: |
+            .
+            pyo3-benches
+          save-if: ${{ github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'CI-save-pr-cache') }}
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
+
+      - uses: taiki-e/install-action@v2.90.8
+        with:
+          tool: cargo-codspeed
+
+      - name: Run the benchmarks
+        uses: CodSpeedHQ/action@v5.8.0
+        with:
+          run: uv run --isolated --only-group nox nox -s codspeed
+          token: ${{ secrets.CODSPEED_TOKEN }}
+          mode: simulation

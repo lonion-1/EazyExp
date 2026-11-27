@@ -1,0 +1,16 @@
+[package]
+authors = ["konstin <konstin@mailbox.org>"]
+name = "pyo3-no-extension-module"
+version = "2.1.0"
+description = "Does not use the extension-module feature, thus erroneously linking libpython"
+edition = "2021"
+
+[dependencies]
+# We pin pyo3 to 0.25.0 here because newer versions (0.26+) use PYO3_BUILD_EXTENSION_MODULE
+# environment variable which maturin sets, effectively preventing the "links libpython" error
+# even if extension-module feature is missing.
+pyo3 = { version = "0.25.0", default-features = false }
+
+[lib]
+name = "pyo3_no_extension_module"
+crate-type = ["cdylib"]

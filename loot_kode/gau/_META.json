@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:33.846810+00:00",
+  "name": "gau",
+  "repo": "lc/gau",
+  "branch": "master",
+  "license": "MIT",
+  "stars": 5185,
+  "commit_sha": "4eabace309877abb231def9eeb27b96c07ed3635",
+  "last_commit_date": "2026-10-12T18:36:10Z",
+  "files_count": 24,
+  "total_bytes": 47831,
+  "output_dir": "./loot_kode/gau"
+}

@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:04:59.014937+00:00",
+  "name": "tantivy",
+  "repo": "quickwit-oss/tantivy",
+  "branch": "main",
+  "license": "MIT",
+  "stars": 16489,
+  "commit_sha": "c005b68425675a1a022f5c28c872d932260e454b",
+  "last_commit_date": "2026-11-26T20:08:08Z",
+  "files_count": 594,
+  "total_bytes": 8225673,
+  "output_dir": "./loot_kode/tantivy"
+}

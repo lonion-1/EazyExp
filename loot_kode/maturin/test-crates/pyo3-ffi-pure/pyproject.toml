@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyo3-ffi-pure"
+classifiers = [
+    "Programming Language :: Rust"
+]
+description = "Tests compilation of packages using pyo3-ffi bindings"
+readme = "README.md"
+maintainers = [
+    {name = "messense", email = "messense@icloud.com"}
+]
+license = { file = "LICENSE" }
+dynamic = ["version"]

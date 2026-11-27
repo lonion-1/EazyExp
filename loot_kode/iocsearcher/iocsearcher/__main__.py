@@ -1,0 +1,276 @@
+#!/usr/bin/env python3
+#
+# Copyright (c) MaliciaLab, 2023.
+# This code is licensed under the MIT license. 
+# See the LICENSE file in the iocsearcher project root for license terms. 
+#
+import os
+import sys
+import argparse
+import logging
+from importlib.metadata import version
+from iocsearcher.ioc import create_ioc
+from iocsearcher.document import open_document
+from iocsearcher.doc_base import Document
+from iocsearcher.searcher import Searcher, blockchain_types
+
+# Set logging
+log = logging.getLogger(__name__)
+
+# Avoid log messages from specific modules below given log level
+logging.getLogger("pdfminer.pdfdocument").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.pdfpage").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.pdfinterp").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.converter").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.cmapdb").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.psparser").setLevel(logging.CRITICAL)
+logging.getLogger("pdfminer.pdfparser").setLevel(logging.CRITICAL)
+
+def main():
+
+    argparser = argparse.ArgumentParser(prog='iocsearcher')
+
+    argparser.add_argument('-f', action='append',
+       help = 'Input file to search IOCs.')
+
+    argparser.add_argument('-d', '--dir',
+       help = 'Input directory. Search IOCs in all its files.')
+
+    argparser.add_argument('-r', '--raw', action='store_true',
+       help = 'Use raw search on HTML.')
+
+    argparser.add_argument('-t', '--target', action='append',
+       help = 'Search this target IOC name.')
+
+    argparser.add_argument('-o', '--output',
+       help = 'Output IOCs to this file.')
+
+    argparser.add_argument('-l', '--links', action='store_true',
+       help = 'Search links for IOCs.')
+
+    argparser.add_argument('-p', '--phone',
+       help = 'Search for phone numbers.')
+
+    argparser.add_argument('-m', '--metadata', action='store_true',
+       help = 'Include metadata IOCs.')
+
+    argparser.add_argument('-s', '--schema', action='store_true',
+       help = 'Include HTML schema.org IOCs.')
+
+    argparser.add_argument('-F', '--forcetext', action='store_true',
+       help = 'Treat the input file as text, no filetype detection.')
+
+    argparser.add_argument('-O', '--nooverlaps', action='store_true',
+       help = 'Remove overlapping indicators.')
+
+    argparser.add_argument('-S', '--script', action='store_true',
+       help = 'Include Script IOCs.')
+
+    argparser.add_argument('-R', '--readability', action='store_true',
+        help='use Readability.js for text extraction')
+
+    argparser.add_argument('-T', '--text', action='store_true',
+        help='store file text into separate file with .text extension')
+
+    argparser.add_argument('-a', '--all', action='store_true',
+        help='Disables deduplication. Outputs all match locations')
+
+    argparser.add_argument('-v', '--verbose', action='store_true',
+        help='verbose. Prints debug information')
+
+    argparser.add_argument('-P', '--patterns',
+       help = 'Use patterns in this file instead of the default patterns.')
+
+    argparser.add_argument('-N', '--normalize', action='store_true',
+        help='store normalized text into file with .normalized extension')
+
+    argparser.add_argument('-V', '--version', action='version',
+            version=version('iocsearcher'))
+
+    # Parse arguments
+    args = argparser.parse_args()
+
+    if (not args.f) and (not args.dir):
+        log.warning("No input file. Use -f or -d options")
+        argparser.print_usage()
+        sys.exit(1)
+
+    # Choose log message level
+    if args.verbose:
+        debug_level = logging.DEBUG
+    else:
+        debug_level = logging.INFO
+
+    # Enable logging
+    #formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+    formatter = logging.Formatter(u'%(message)s')
+    handler_stderr = logging.StreamHandler(sys.stderr)
+    handler_stderr.setLevel(debug_level)
+    handler_stderr.setFormatter(formatter)
+    root = logging.getLogger()
+    root.setLevel(debug_level)
+    root.addHandler(handler_stderr)
+
+    # Create Searcher object
+    searcher = Searcher(patterns_ini=args.patterns,
+                        create_ioc_fun=create_ioc)
+
+    # List of files to scan
+    files = args.f if args.f is not None else []
+    if args.dir:
+        dir_files = [ os.path.join(args.dir, f) for f in os.listdir(args.dir) \
+                                if os.path.isfile(os.path.join(args.dir, f))]
+        files.extend(dir_files)
+
+    # Set targets
+    if args.target:
+        target_l = []
+        for t in args.target:
+            if t == 'BLOCKCHAIN':
+                target_l.extend(blockchain_types)
+            else:
+                target_l.append(t)
+    else:
+        target_l = None
+
+    # Iterate on files
+    all_iocs = set()
+    all_raw_iocs = {}
+    for filepath in sorted(files):
+        # Read data from standard input
+        if filepath == "-":
+            text = sys.stdin.read()
+        # Otherwise open file and get text
+        else:
+            log.info("Searching into %s" % filepath)
+
+            # Open document
+            if (not args.forcetext):
+                doc = open_document(filepath)
+            else:
+                doc = Document(filepath, mime_type='text/plain')
+            if doc is None:
+                log.warning("Skipping unsupported file: %s" % filepath)
+                continue
+
+            # Extract text
+            options = {
+                        'html_raw' : args.raw,
+                        'html_use_readability' : args.readability,
+                      }
+            text = doc.get_text(options=options)[0]
+            if not text:
+                log.error("Could not obtain text from %s" % filepath)
+                continue
+
+        # Output text to file
+        if args.text:
+            text_filepath = filepath + '.text'
+            fd = open(text_filepath, "w")
+            fd.write(text)
+            fd.close()
+
+        # Output normalized text to file
+        if args.normalize:
+            normalized_text, _ = searcher.normalize_text(text)
+            text_filepath = filepath + '.normalized'
+            fd = open(text_filepath, "w")
+            fd.write(normalized_text)
+            fd.close()
+
+        # Get all matches without deduplication
+        if args.all:
+            # Get all matches
+            raw_iocs = searcher.search_matches(text, targets=target_l)
+            # Remove overlaps if requested or computing the ranking
+            if args.nooverlaps:
+                raw_iocs = searcher.remove_overlaps(raw_iocs)
+        # Otherwise, get deduplicated IOCs
+        else:
+            iocs = set()
+            # Search file
+            matches = searcher.search_data(text,
+                                           targets=target_l,
+                                           no_overlaps=args.nooverlaps)
+            iocs.update(matches)
+
+            # Search for phone numbers
+            if args.phone:
+                phone_iocs = searcher.search_phone_numbers(text, args.phone)
+                iocs.update(phone_iocs)
+
+            # Search links for IOCs
+            if args.links:
+                if doc.is_html:
+                    iocs.update(doc.get_html_link_iocs(searcher))
+                else:
+                    log.warning("No links in non-HTML file")
+
+            # Extract schema.org IOCs
+            if args.schema:
+                if doc.is_html:
+                    iocs.update(doc.get_html_schema_iocs(searcher))
+                else:
+                    log.warning("No Schema.org data for non-HTML file")
+
+            # Extract metadata IOCs
+            if args.metadata:
+                metadata = doc.get_metadata()
+                log.info("Metadata = %s" % metadata)
+                iocs.update(doc.metadata_iocs(searcher, metadata))
+
+            # Extract script IOCs
+            if args.script:
+                if isinstance(doc, Html):
+                    iocs.update(doc.get_html_script_iocs(searcher))
+                else:
+                    log.warning("No Script data for non-HTML file")
+
+        # Output IOCs if no global output file
+        if not args.output:
+            # Open file
+            ioc_filepath = filepath + '.iocs'
+            out_fd = open(ioc_filepath, "w")
+
+            # Write IOCs
+            if args.all:
+                for raw_ioc in sorted(raw_iocs, key=lambda r : (
+                                      r.start_offset,-len(r.value))):
+                    log.info(raw_ioc)
+                    out_fd.write("%s\n" % (raw_ioc))
+            else:
+                for ioc in sorted(iocs):
+                    log.info("%s" % ioc)
+                    out_fd.write("%s\n" % ioc)
+
+            # Close file
+            out_fd.close()
+
+        # Store IOCs if global output file
+        if args.output:
+            if args.all:
+                all_raw_iocs[filepath] = iocs
+            else:
+                all_iocs.update(iocs)
+
+    # If global output file, output accumulated IOCs
+    if args.output:
+        # Open output file
+        out_fd = open(args.output, "w", encoding='utf-8')
+
+        # Output IOCs
+        if args.all:
+            for filepath, matches in all_raw_iocs.items():
+                for m in matches:
+                    out_fd.write("%s\t%s @ %s:%d Raw: %s\n" % (
+                                  m[0], m[1], filepath, m[2], m[3]))
+        else:
+            for ioc in sorted(all_iocs):
+                out_fd.write("%s\n" % ioc)
+
+        # Close output file
+        out_fd.close()
+
+
+if __name__ == '__main__':
+    main()

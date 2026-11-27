@@ -1,0 +1,153 @@
+# Bindings
+
+Maturin supports several kinds of bindings, some of which are automatically
+detected. You can also pass `-b` / `--bindings` command line option to manually
+specify which bindings to use.
+
+## `pyo3`
+
+[pyo3](https://github.com/PyO3/pyo3) is Rust bindings for Python,
+including tools for creating native Python extension modules.
+It supports CPython, PyPy, and GraalPy.
+
+maturin automatically detects pyo3 bindings when it's added as a dependency in `Cargo.toml`.
+
+### `Py_LIMITED_API`/abi3
+
+The pyo3 bindings support the Python stable ABI (`Py_LIMITED_API`/abi3/abi3t).
+You can use it by enabling both `abi3` and `abi3t` features with a minimum
+supported Python version for each:
+
+```toml
+pyo3 = { version = "0.29.0", features = ["abi3-py310", "abi3t-py315"] }
+```
+
+A single maturin build selects one stable ABI family. If you want to publish
+both a GIL-enabled `abi3` wheel and an `abi3t` wheel, run separate wheel builds
+explicitly, with compatible interpreters:
+
+```console
+maturin build --interpreter python3.10
+maturin build --interpreter python3.15t
+```
+
+A GIL-enabled CPython 3.15 or newer interpreter can also build the `abi3t`
+wheel when using PyO3 0.29 or newer.
+
+An `abi3-py310` wheel supports all GIL-enabled CPython
+versions from Python 3.10 and newer, while the `abi3.abi3t` wheel supports
+Python 3.15 and all newer versions of CPython. Free-threaded CPython 3.14 does
+not support the `abi3t` stable ABI, so maturin builds a version-specific
+`cp314-cp314t` wheel for it instead.
+
+Do not rely on a single build with both `abi3` and `abi3t` Cargo features to
+produce both stable ABI wheels. maturin will choose at most one stable ABI
+family for the build and emit version-specific fallback wheels for interpreters
+that cannot use that family.
+
+> **Note**: Read more about stable ABI support in [pyo3's
+>     documentation](https://pyo3.rs/latest/building-and-distribution#py_limited_apiabi3abi3t). You
+>     can read more about using abi3 and abi3t wheels simultaneously in the
+>     HOWTO guide on migrating to abi3t: https://docs.python.org/3.16/howto/abi3t-migration.html#why-do-this.
+
+### Cross Compiling
+
+pyo3 bindings has decent cross compilation support.
+For manylinux support the [manylinux-cross](https://github.com/rust-cross/manylinux-cross) docker images can be used.
+
+> **Note**: Read more about cross compiling in [pyo3's
+> documentation](https://pyo3.rs/latest/building-and-distribution#cross-compiling).
+
+## `cffi`
+
+Cffi wheels are compatible with all python versions including pypy. If `cffi`
+isn't installed and python is running inside a virtualenv, maturin will install
+it, otherwise you have to install it yourself (`pip install cffi`).
+
+Maturin uses cbindgen to generate a header file for [supported Rust
+types](https://github.com/eqrion/cbindgen/blob/master/docs.md#supported-types).
+The header file can be customized by configuring cbindgen through a
+`cbindgen.toml` file inside your project root. Aternatively you can use a build
+script that writes a header file to `$PROJECT_ROOT/target/header.h`, like so:
+
+```rust
+use cbindgen;
+use std::env;
+use std::path::Path;
+
+fn main() {
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+
+    let bindings = cbindgen::Builder::new()
+        .with_no_includes()
+        .with_language(cbindgen::Language::C)
+        .with_crate(crate_dir)
+        .generate()
+        .unwrap();
+    bindings.write_to_file(Path::new("target").join("header.h"));
+}
+```
+
+Maturin uses the cbindgen-generated header to create a module that exposes `ffi` and
+`lib` objects as attributes. See the [cffi docs](https://cffi.readthedocs.io/en/latest/using.html)
+for more information on using these `ffi`/`lib` objects to call the Rust code
+from Python.
+
+> **Note**: Maturin _does not_ automatically detect `cffi` bindings. You _must_
+> specify them via either command line with `-b cffi` or in `pyproject.toml`.
+
+Maturin automatically detect `cffi` bindings, but only if there is no pyo3
+dependency. You can specify `cffi` explicitly via either command line with
+`-b cffi` or in `pyproject.toml`.
+
+## `bin`
+
+Maturin also supports distributing binary applications written in Rust as
+Python packages using the `bin` bindings. Binaries are packaged into the wheel
+as "scripts" and are available on the user's `PATH` (e.g. in the `bin`
+directory of a virtual environment) once installed.
+
+Maturin automatically detect `bin` bindings, but only if there
+is only a binary target and no pyo3 dependency or cdylib target. You can
+specify `bin` explicitly via either command line with `-b bin` or in `pyproject.toml`.
+
+### Both binary and library?
+
+Shipping both a binary and library would double the size of your wheel. Consider instead exposing a CLI function in the library and using a Python entrypoint:
+
+```rust
+#[pyfunction]
+fn print_cli_args(py: Python) -> PyResult<()> {
+    // This one includes python and the name of the wrapper script itself, e.g.
+    // `["/home/ferris/.venv/bin/python", "/home/ferris/.venv/bin/print_cli_args", "a", "b", "c"]`
+    println!("{:?}", env::args().collect::<Vec<_>>());
+    // This one includes only the name of the wrapper script itself, e.g.
+    // `["/home/ferris/.venv/bin/print_cli_args", "a", "b", "c"])`
+    println!(
+        "{:?}",
+        py.import("sys")?
+            .getattr("argv")?
+            .extract::<Vec<String>>()?
+    );
+    Ok(())
+}
+
+#[pymodule]
+fn my_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_wrapped(wrap_pyfunction!(print_cli_args))?;
+
+    Ok(())
+}
+```
+
+In pyproject.toml:
+
+```toml
+[project.scripts]
+print_cli_args = "my_module:print_cli_args"
+```
+
+## `uniffi`
+
+uniffi bindings use [uniffi-rs](https://mozilla.github.io/uniffi-rs/) to generate Python `ctypes` bindings
+from an interface definition file. uniffi wheels are compatible with all python versions including pypy.

@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:26.071273+00:00",
+  "name": "phishing_catcher",
+  "repo": "x0rz/phishing_catcher",
+  "branch": "master",
+  "license": "GPL-3.0",
+  "stars": 1833,
+  "commit_sha": "089208e3b8f052d494767c066866e80869add0cf",
+  "last_commit_date": "2020-12-08T10:11:30Z",
+  "files_count": 8,
+  "total_bytes": 87843,
+  "output_dir": "./loot_kode/phishing_catcher"
+}

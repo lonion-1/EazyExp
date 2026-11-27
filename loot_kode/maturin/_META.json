@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:15.756620+00:00",
+  "name": "maturin",
+  "repo": "PyO3/maturin",
+  "branch": "main",
+  "license": "Apache-2.0",
+  "stars": 5931,
+  "commit_sha": "0796ba6b87ae6d0d769b35f735f1d4afaf7ab2f4",
+  "last_commit_date": "2026-11-26T07:20:29Z",
+  "files_count": 535,
+  "total_bytes": 2985747,
+  "output_dir": "./loot_kode/maturin"
+}

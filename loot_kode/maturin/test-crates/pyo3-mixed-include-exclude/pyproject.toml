@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pyo3-mixed-include-exclude"
+readme = "README.md"
+classifiers = ["Programming Language :: Python", "Programming Language :: Rust"]
+requires-python = ">=3.7"
+dynamic = ["version"]
+
+[project.scripts]
+get_42 = "pyo3_mixed_include_exclude:get_42"
+
+[tool.maturin]
+include = [
+  "pyo3_mixed_include_exclude/include_this_file",
+  "missing",
+  "README.md",
+  { path = "generated_info.txt", from = "out-dir", to = "pyo3_mixed_include_exclude/" },
+]
+exclude = [
+  "pyo3_mixed_include_exclude/exclude_this_file",
+  "pyo3_mixed_include_exclude/.gitignore",
+  "tests/**/*",
+  "unused",
+]

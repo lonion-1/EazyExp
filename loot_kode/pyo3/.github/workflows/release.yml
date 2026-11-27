@@ -1,0 +1,37 @@
+name: Release Rust Crate
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to build
+
+jobs:
+  release:
+    permissions:
+      contents: read
+      id-token: write
+
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          # The tag to build or the tag received by the tag event
+          ref: ${{ github.event.inputs.version || github.ref }}
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: false
+
+      - uses: rust-lang/crates-io-auth-action@v1.0.6
+        id: auth
+
+      - name: Publish to crates.io
+        run: cargo publish --workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

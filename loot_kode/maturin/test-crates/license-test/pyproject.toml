@@ -1,0 +1,11 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "license-test"
+license = { file = "LICENCE.txt" }
+dynamic = ["version", "license"]  # Allow license from Cargo.toml to be used
+
+[tool.maturin]
+bindings = "bin"

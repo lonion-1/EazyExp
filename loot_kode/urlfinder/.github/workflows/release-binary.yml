@@ -1,0 +1,19 @@
+name: 🎉 Release Binary
+
+on:
+  push:
+    tags:
+      - v*
+  workflow_dispatch:
+
+jobs:
+  release:
+    uses: projectdiscovery/workflows/.github/workflows/goreleaser-publish.yaml@v1
+    permissions:
+      contents: write
+    secrets:
+      docker-username: ${{ secrets.DOCKER_USERNAME }}
+      docker-token: ${{ secrets.DOCKER_TOKEN }}
+      slack-webhook: ${{ secrets.RELEASE_SLACK_WEBHOOK }}
+      discord-webhook-id: ${{ secrets.DISCORD_WEBHOOK_ID }}
+      discord-webhook-token: ${{ secrets.DISCORD_WEBHOOK_TOKEN }}

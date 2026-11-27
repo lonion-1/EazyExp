@@ -1,0 +1,238 @@
+use anyhow::format_err;
+use anyhow::{Result, bail};
+use clap::Parser;
+use maturin::{BuildOptions, BuildOrchestrator};
+use pretty_assertions::assert_eq;
+use std::path::Path;
+use std::process::Command;
+use std::str;
+
+/// Check that you get a good error message if you forgot to set the extension-module feature
+pub fn pyo3_no_extension_module() -> Result<()> {
+    let target_dir = crate::common::shared_target_dir("test-crates/pyo3-no-extension-module")
+        .display()
+        .to_string();
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "--manifest-path",
+        "test-crates/pyo3-no-extension-module/Cargo.toml",
+        "--quiet",
+        "--target-dir",
+        target_dir.as_str(),
+        "--out",
+        "test-crates/targets/pyo3_no_extension_module",
+        "--auditwheel",
+        "check",
+    ];
+
+    let options = BuildOptions::try_parse_from(cli)?;
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let _fixture_lock = crate::common::lock_fixture("test-crates/pyo3-no-extension-module")?;
+    let result = BuildOrchestrator::new(&build_context).build_wheels();
+    if let Err(err) = result {
+        if !(err
+            .source()
+            .ok_or_else(|| format_err!("{}", err))?
+            .to_string()
+            .starts_with("Your library links libpython"))
+        {
+            return Err(err);
+        }
+    } else {
+        bail!("Should have errored");
+    }
+
+    Ok(())
+}
+
+/// Make sure cargo metadata doesn't create a lock file when --locked was passed
+///
+/// https://github.com/PyO3/maturin/issues/472
+pub fn locked_doesnt_build_without_cargo_lock() -> Result<()> {
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "--manifest-path",
+        "test-crates/lib_with_path_dep/Cargo.toml",
+        "--locked",
+        "-itargetspython",
+        "--target-dir",
+        "test-crates/targets/locked_doesnt_build_without_cargo_lock",
+    ];
+    let options = BuildOptions::try_parse_from(cli)?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+    if let Err(err) = result {
+        let err_string = err
+            .source()
+            .ok_or_else(|| format_err!("{}", err))?
+            .to_string();
+        if !err_string.starts_with("`cargo metadata` exited with an error:") {
+            bail!("{:?}", err_string);
+        }
+    } else {
+        bail!("Should have errored");
+    }
+
+    Ok(())
+}
+
+/// Don't panic if the manylinux version doesn't exit
+///
+/// https://github.com/PyO3/maturin/issues/739
+pub fn invalid_manylinux_does_not_panic() -> Result<()> {
+    let target_dir = crate::common::shared_target_dir("test-crates/pyo3-mixed")
+        .display()
+        .to_string();
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "-m",
+        "test-crates/pyo3-mixed/Cargo.toml",
+        "--compatibility",
+        "manylinux_2_99",
+        "--target-dir",
+        target_dir.as_str(),
+        "--out",
+        "test-crates/targets/invalid_manylinux_does_not_panic",
+    ];
+    let options: BuildOptions = BuildOptions::try_parse_from(cli)?;
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let _fixture_lock = crate::common::lock_fixture("test-crates/pyo3-mixed")?;
+    let result = BuildOrchestrator::new(&build_context).build_wheels();
+    if let Err(err) = result {
+        assert_eq!(err.to_string(), "Error ensuring manylinux_2_99 compliance");
+        let err_string = err
+            .source()
+            .ok_or_else(|| format_err!("{}", err))?
+            .to_string();
+        assert_eq!(
+            err_string,
+            "manylinux_2_99 compatibility policy is not defined by auditwheel yet, pass `--auditwheel=skip` to proceed anyway"
+        );
+    } else {
+        bail!("Should have errored");
+    }
+
+    Ok(())
+}
+
+/// The user set `python-source` in pyproject.toml, but there is no python module in there
+pub fn error_on_missing_python_source() -> Result<()> {
+    let output = Command::new(env!("CARGO_BIN_EXE_maturin"))
+        .arg("build")
+        .arg("-m")
+        .arg(
+            Path::new("test-crates")
+                .join("wrong-python-source")
+                .join("Cargo.toml"),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "Expected build to fail when python-source is set but module is missing"
+    );
+    let stderr = str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("python-source is set to"),
+        "Expected error about missing python-source, got: {stderr}"
+    );
+    Ok(())
+}
+
+/// Check the `--compatibility pypi` error for unsupported targets.
+///
+/// Regression test for <https://github.com/astral-sh/uv/pull/14006>,
+/// where uv tried to upload a wheel with platform tag `manylinux_2_31_riscv64`
+/// but PyPI rejected it because RISC-V is not in PyPI's allowed architectures.
+pub fn pypi_compatibility_unsupported_target() -> Result<()> {
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "-m",
+        "test-crates/pyo3-mixed/Cargo.toml",
+        "--compatibility",
+        "pypi",
+        "--target",
+        "riscv32gc-unknown-linux-gnu", // Unsupported by PyPI
+        "--target-dir",
+        "test-crates/targets/pypi_compatibility_unsupported_target",
+        "--out",
+        "test-crates/targets/pypi_compatibility_unsupported_target",
+        "-i",
+        "python3.12", // Add interpreter to bypass interpreter detection
+    ];
+    let options: BuildOptions = BuildOptions::try_parse_from(cli)?;
+    let result = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build();
+
+    if let Err(err) = result {
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains("Rust target riscv32gc-unknown-linux-gnu is not supported by PyPI"),
+            "{err_string}",
+        );
+    } else {
+        bail!("Should have errored");
+    }
+
+    Ok(())
+}
+
+/// Test that `--compatibility pypi` cannot be used with the linux tag.
+#[cfg(target_os = "linux")]
+pub fn pypi_compatibility_linux_tag() -> Result<()> {
+    let target_dir = crate::common::shared_target_dir("test-crates/hello-world")
+        .display()
+        .to_string();
+    // The first argument is ignored by clap
+    let cli = vec![
+        "build",
+        "-m",
+        "test-crates/hello-world/Cargo.toml",
+        "--compatibility",
+        "pypi",
+        "--compatibility",
+        "linux", // Should fail when combined with pypi
+        "--target-dir",
+        target_dir.as_str(),
+        "--out",
+        "test-crates/targets/pypi_compatibility_linux_tag",
+    ];
+    let options: BuildOptions = BuildOptions::try_parse_from(cli)?;
+    let build_context = options
+        .into_build_context()
+        .strip(crate::common::TEST_STRIP)
+        .editable(false)
+        .build()?;
+    let _fixture_lock = crate::common::lock_fixture("test-crates/hello-world")?;
+    let result = BuildOrchestrator::new(&build_context).build_wheels();
+
+    if let Err(err) = result {
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains("PyPI validation failed"),
+            "{err_string}",
+        );
+    } else {
+        bail!("Should have errored");
+    }
+
+    Ok(())
+}

@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T14:05:32.707583+00:00",
+  "name": "urlfinder",
+  "repo": "projectdiscovery/urlfinder",
+  "branch": "dev",
+  "license": "MIT",
+  "stars": 924,
+  "commit_sha": "97e2b930f8933c0c9036bd6736f013f8b1f30de9",
+  "last_commit_date": "2026-11-26T16:40:25Z",
+  "files_count": 62,
+  "total_bytes": 172853,
+  "output_dir": "./loot_kode/urlfinder"
+}
