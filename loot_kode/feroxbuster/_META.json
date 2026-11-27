@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T06:51:07.581524+00:00",
+  "name": "feroxbuster",
+  "repo": "epi052/feroxbuster",
+  "branch": "main",
+  "license": "MIT",
+  "stars": 8200,
+  "commit_sha": "f89b6c6d305421d7b29e26997960317e64c64dae",
+  "last_commit_date": "2026-11-12T17:55:18Z",
+  "files_count": 125,
+  "total_bytes": 1283753,
+  "output_dir": "./loot_kode/feroxbuster"
+}

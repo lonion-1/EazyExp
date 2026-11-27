@@ -1,0 +1,1071 @@
+package templates
+
+import (
+	"crypto/sha256"
+	"fmt"
+	"io"
+	"reflect"
+	"slices"
+	"sync"
+	"sync/atomic"
+
+	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/logrusorgru/aurora/v4"
+	"github.com/pkg/errors"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/yaml"
+
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v3/pkg/catalog/config"
+	"github.com/projectdiscovery/nuclei/v3/pkg/js/compiler"
+	"github.com/projectdiscovery/nuclei/v3/pkg/model/types/severity"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/globalmatchers"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/offlinehttp"
+	"github.com/projectdiscovery/nuclei/v3/pkg/templates/signer"
+	templateTypes "github.com/projectdiscovery/nuclei/v3/pkg/templates/types"
+	"github.com/projectdiscovery/nuclei/v3/pkg/tmplexec"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/json"
+	"github.com/projectdiscovery/nuclei/v3/pkg/workflows"
+	"github.com/projectdiscovery/utils/errkit"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+)
+
+var (
+	ErrCreateTemplateExecutor          = errors.New("cannot create template executer")
+	ErrIncompatibleWithOfflineMatching = errors.New("template can't be used for offline matching")
+	// track how many templates are verified and by which signer
+	SignatureStats = map[string]*atomic.Uint64{}
+)
+
+const (
+	Unsigned = "unsigned"
+)
+
+func init() {
+	for _, verifier := range signer.DefaultTemplateVerifiers {
+		SignatureStats[verifier.Identifier()] = &atomic.Uint64{}
+	}
+	SignatureStats[Unsigned] = &atomic.Uint64{}
+}
+
+// updateRequestOptions updates options for all request types in a template
+func updateRequestOptions(template *Template) {
+	requests := make(map[protocols.Request]protocols.Request, template.Requests())
+
+	for i, r := range template.RequestsDNS {
+		if i == 0 {
+			template.RequestsDNS = append(template.RequestsDNS[:0:0], template.RequestsDNS...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsDNS[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsHTTP {
+		if i == 0 {
+			template.RequestsHTTP = append(template.RequestsHTTP[:0:0], template.RequestsHTTP...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsHTTP[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsCode {
+		if i == 0 {
+			template.RequestsCode = append(template.RequestsCode[:0:0], template.RequestsCode...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsCode[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsFile {
+		if i == 0 {
+			template.RequestsFile = append(template.RequestsFile[:0:0], template.RequestsFile...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsFile[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsHeadless {
+		if i == 0 {
+			template.RequestsHeadless = append(template.RequestsHeadless[:0:0], template.RequestsHeadless...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsHeadless[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsNetwork {
+		if i == 0 {
+			template.RequestsNetwork = append(template.RequestsNetwork[:0:0], template.RequestsNetwork...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsNetwork[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsJavascript {
+		if i == 0 {
+			template.RequestsJavascript = append(template.RequestsJavascript[:0:0], template.RequestsJavascript...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsJavascript[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsSSL {
+		if i == 0 {
+			template.RequestsSSL = append(template.RequestsSSL[:0:0], template.RequestsSSL...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsSSL[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsWHOIS {
+		if i == 0 {
+			template.RequestsWHOIS = append(template.RequestsWHOIS[:0:0], template.RequestsWHOIS...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsWHOIS[i] = rCopy
+		requests[r] = rCopy
+	}
+	for i, r := range template.RequestsWebsocket {
+		if i == 0 {
+			template.RequestsWebsocket = append(template.RequestsWebsocket[:0:0], template.RequestsWebsocket...)
+		}
+		rCopy := cloneProtocolRequest(r)
+		rCopy.UpdateOptions(template.Options)
+		template.RequestsWebsocket[i] = rCopy
+		requests[r] = rCopy
+	}
+
+	if len(template.RequestsQueue) > 0 {
+		queue := append(template.RequestsQueue[:0:0], template.RequestsQueue...)
+		for i, request := range queue {
+			if mapped, ok := requests[request]; ok {
+				queue[i] = mapped
+			}
+		}
+		template.RequestsQueue = queue
+	}
+}
+
+func cloneProtocolRequest[T any](request *T) *T {
+	cloned := cloneTemplateValue(reflect.ValueOf(request), make(map[cloneVisit]reflect.Value))
+	return cloned.Interface().(*T)
+}
+
+// parseFromSource parses a template from source with caching support
+func parseFromSource(filePath string, preprocessor Preprocessor, options *protocols.ExecutorOptions, parser *Parser) (*Template, error) {
+	options = options.Copy()
+	options.TemplatePath = filePath
+
+	var template *Template
+	var cacheableTemplate *Template
+	var err error
+
+	if !options.DoNotCache {
+		parsed, raw, cachedErr := parser.parsedTemplatesCache.Has(filePath)
+		if cachedErr != nil {
+			return nil, cachedErr
+		}
+
+		if parsed != nil && len(raw) > 0 {
+			template, cacheableTemplate, err = parseCachedTemplate(parsed, raw, preprocessor, options)
+		}
+	}
+
+	if template == nil && err == nil {
+		reader, openErr := utils.ReaderFromPathOrURL(filePath, options.Catalog)
+		if openErr != nil {
+			return nil, openErr
+		}
+
+		defer func() {
+			_ = reader.Close()
+		}()
+
+		data, readErr := io.ReadAll(reader)
+		if readErr != nil {
+			return nil, readErr
+		}
+
+		template, cacheableTemplate, err = parseTemplateFromData(data, preprocessor, options)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+	if cacheableTemplate != nil {
+		copyTemplateVerification(cacheableTemplate, template)
+	}
+
+	if template.isGlobalMatchersEnabled() {
+		item := &globalmatchers.Item{
+			TemplateID:   template.ID,
+			TemplatePath: filePath,
+			TemplateInfo: template.Info,
+		}
+
+		for _, request := range template.RequestsHTTP {
+			item.Operators = append(item.Operators, request.CompiledOperators)
+		}
+
+		options.GlobalMatchers.AddOperator(item)
+
+		return nil, nil
+	}
+
+	// Compile the workflow request
+	if len(template.Workflows) > 0 {
+		compiled := &template.Workflow
+
+		compileWorkflow(filePath, preprocessor, options, compiled, options.WorkflowLoader)
+		template.CompiledWorkflow = compiled
+		template.CompiledWorkflow.Options = options
+	}
+
+	template.Path = filePath
+	if !options.DoNotCache && cacheableTemplate != nil {
+		parser.compiledTemplatesCache.StoreWithoutRaw(filePath, cacheSafeCompiledTemplate(cacheableTemplate), err)
+	}
+
+	return template, nil
+}
+
+// cacheSafeCompiledTemplate removes execution-scoped state from the
+// pre-compilation snapshot before storing it in the shared cache. Its requests
+// are uncompiled clones that every cache hit clones and compiles again, so they
+// carry no options of their own.
+func cacheSafeCompiledTemplate(template *Template) *Template {
+	tplCopy := *template
+	tplCopy.Executer = nil
+	tplCopy.CompiledWorkflow = nil
+	tplCopy.Workflows = cloneWorkflowDefinitions(template.Workflows)
+	tplCopy.Options = cacheSafeExecutorOptions(template.Options)
+
+	return &tplCopy
+}
+
+// copyTemplateVerification mirrors verification metadata onto the cacheable
+// pre-compilation template copy.
+func copyTemplateVerification(dst, src *Template) {
+	if dst == nil || src == nil {
+		return
+	}
+
+	dst.Verified = src.Verified
+	dst.TemplateVerifier = src.TemplateVerifier
+	dst.verificationDigest = src.verificationDigest
+	dst.verifierFingerprint = src.verifierFingerprint
+	if dst.Options != nil && src.Options != nil {
+		dst.Options.TemplateVerifier = src.Options.TemplateVerifier
+		dst.Options.Verified = src.Options.Verified
+		dst.Options.RawTemplate = src.Options.RawTemplate
+	}
+}
+
+// cacheSafeExecutorOptions copies immutable template metadata and drops
+// per-execution objects such as writers, rate limiters, and callbacks.
+func cacheSafeExecutorOptions(options *protocols.ExecutorOptions) *protocols.ExecutorOptions {
+	if options == nil {
+		return nil
+	}
+
+	safeOptions := options.Copy()
+	optionsVisited := newCloneVisited()
+	safeOptions.Variables = cloneTemplateVariables(options.Variables, optionsVisited)
+	safeOptions.Constants = cloneTemplateConstants(options.Constants, optionsVisited)
+	safeOptions.ResumeCfg = nil
+	safeOptions.TemplateVerificationCallback = nil
+	safeOptions.Output = nil
+	safeOptions.IssuesClient = nil
+	safeOptions.Progress = nil
+	safeOptions.RateLimiter = nil
+	safeOptions.Catalog = nil
+	safeOptions.ProjectFile = nil
+	safeOptions.Browser = nil
+	safeOptions.Interactsh = nil
+	safeOptions.HostErrorsCache = nil
+	safeOptions.InputHelper = nil
+	safeOptions.FuzzStatsDB = nil
+	safeOptions.WorkflowLoader = nil
+	safeOptions.Parser = nil
+	safeOptions.GlobalMatchers = nil
+	safeOptions.Logger = nil
+	safeOptions.AuthProvider = nil
+	safeOptions.TemporaryDirectory = ""
+
+	return safeOptions
+}
+
+// cloneWorkflowDefinitions copies workflow definitions without compiled
+// executers so cache hits can rebuild workflow execution state per call.
+func cloneWorkflowDefinitions(items []*workflows.WorkflowTemplate) []*workflows.WorkflowTemplate {
+	if len(items) == 0 {
+		return nil
+	}
+
+	cloned := make([]*workflows.WorkflowTemplate, len(items))
+	for i, item := range items {
+		if item == nil {
+			continue
+		}
+		itemCopy := *item
+		itemCopy.Executers = nil
+		itemCopy.Subtemplates = cloneWorkflowDefinitions(item.Subtemplates)
+		itemCopy.Matchers = cloneWorkflowMatchers(item.Matchers)
+		cloned[i] = &itemCopy
+	}
+	return cloned
+}
+
+// cloneWorkflowMatchers copies workflow matchers and their subtemplate
+// definitions while leaving matcher compile state to the per-call compile path.
+func cloneWorkflowMatchers(items []*workflows.Matcher) []*workflows.Matcher {
+	if len(items) == 0 {
+		return nil
+	}
+
+	cloned := make([]*workflows.Matcher, len(items))
+	for i, item := range items {
+		if item == nil {
+			continue
+		}
+		itemCopy := *item
+		itemCopy.Subtemplates = cloneWorkflowDefinitions(item.Subtemplates)
+		cloned[i] = &itemCopy
+	}
+	return cloned
+}
+
+func parseCachedTemplate(cached *Template, data []byte, preprocessor Preprocessor, options *protocols.ExecutorOptions) (*Template, *Template, error) {
+	if hasTemplatePreprocessor(data, preprocessor) {
+		return parseTemplateFromData(data, preprocessor, options)
+	}
+
+	template, err := prepareTemplate(cloneTemplate(cached), options)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Metadata-cache entries have no executor options. Snapshot the prepared
+	// definition before compilation applies execution-specific request state.
+	cacheableTemplate := cloneTemplate(template)
+	if err := verifyAndCompileTemplate(template, data); err != nil {
+		return nil, nil, err
+	}
+
+	if !template.Verified && len(template.Workflows) == 0 && config.DefaultConfig.LogAllEvents {
+		gologger.DefaultLogger.Print().Msgf("[%v] Template %s is not signed or tampered\n", aurora.Yellow("WRN").String(), template.ID)
+	}
+	return template, cacheableTemplate, nil
+}
+
+// getParser returns a cached parser instance
+func getParser(options *protocols.ExecutorOptions) *Parser {
+	parser, ok := options.Parser.(*Parser)
+	if !ok || parser == nil {
+		panic("invalid parser")
+	}
+
+	return parser
+}
+
+// Parse parses a yaml request template file
+func Parse(filePath string, preprocessor Preprocessor, options *protocols.ExecutorOptions) (*Template, error) {
+	parser := getParser(options)
+
+	if !options.DoNotCache {
+		if template, ok, err := parseCompiledTemplateFromCache(filePath, preprocessor, options, parser); ok || err != nil {
+			return template, err
+		}
+
+		result, err, shared := parser.compiledTemplatesLoadGroup.Do(filePath, func() (interface{}, error) {
+			if value, _, cacheErr := parser.compiledTemplatesCache.Has(filePath); value != nil || cacheErr != nil {
+				if value != nil && value.Options == nil {
+					return parseFromSource(filePath, preprocessor, options, parser)
+				}
+				return nil, cacheErr
+			}
+			return parseFromSource(filePath, preprocessor, options, parser)
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		// A nil result means the closure found the template already cached, which
+		// happens when another goroutine populated it after the check above. Only a
+		// typed result belongs to this caller; anything else re-reads the cache so
+		// the template is rebuilt against these options.
+		if template, ok := result.(*Template); ok && !shared {
+			return template, nil
+		}
+		if template, ok, err := parseCompiledTemplateFromCache(filePath, preprocessor, options, parser); ok || err != nil {
+			return template, err
+		}
+	}
+
+	return parseFromSource(filePath, preprocessor, options, parser)
+}
+
+func parseCompiledTemplateFromCache(filePath string, preprocessor Preprocessor, options *protocols.ExecutorOptions, parser *Parser) (*Template, bool, error) {
+	value, _, err := parser.compiledTemplatesCache.Has(filePath)
+	if value == nil || err != nil {
+		return nil, value != nil || err != nil, err
+	}
+	if value.Options == nil {
+		return nil, false, nil
+	}
+
+	// Copy the template, apply new options, and recompile requests
+	tplCopy := *value
+	tplCopy.Workflows = cloneWorkflowDefinitions(value.Workflows)
+	newBase := options.Copy()
+	newBase.TemplateID = tplCopy.Options.TemplateID
+	newBase.TemplatePath = tplCopy.Options.TemplatePath
+	newBase.TemplateInfo = tplCopy.Options.TemplateInfo
+	newBase.TemplateVerifier = tplCopy.Options.TemplateVerifier
+	newBase.Verified = tplCopy.Options.Verified
+	newBase.RawTemplate = tplCopy.Options.RawTemplate
+	newBase.Flow = tplCopy.Options.Flow
+	newBase.StopAtFirstMatch = tplCopy.Options.StopAtFirstMatch
+	newBase.ProtocolType = tplCopy.Options.ProtocolType
+	newBase.IsMultiProtocol = tplCopy.Options.IsMultiProtocol
+	newBase.Operators = tplCopy.Options.Operators
+
+	cachedVisited := newCloneVisited()
+	if tplCopy.Options.Variables.Len() > 0 {
+		newBase.Variables = cloneTemplateVariables(tplCopy.Options.Variables, cachedVisited)
+	}
+
+	if len(tplCopy.Options.Constants) > 0 {
+		newBase.Constants = cloneTemplateConstants(tplCopy.Options.Constants, cachedVisited)
+	}
+
+	tplCopy.Options = newBase
+	tplCopy.Options.ApplyNewEngineOptions(options)
+
+	// Update options for all request types
+	updateRequestOptions(&tplCopy)
+	template := &tplCopy
+
+	if template.isGlobalMatchersEnabled() {
+		if err := template.compileProtocolRequests(template.Options); err != nil {
+			return nil, true, err
+		}
+		if template.Executer != nil {
+			if err := template.Executer.Compile(); err != nil {
+				return nil, true, errors.Wrap(err, "could not compile request")
+			}
+			template.TotalRequests = template.Executer.Requests()
+		}
+
+		item := &globalmatchers.Item{
+			TemplateID:   template.ID,
+			TemplatePath: filePath,
+			TemplateInfo: template.Info,
+		}
+
+		for _, request := range template.RequestsHTTP {
+			item.Operators = append(item.Operators, request.CompiledOperators)
+		}
+
+		options.GlobalMatchers.AddOperator(item)
+
+		return nil, true, nil
+	}
+
+	// Compile the workflow request
+	if len(template.Workflows) > 0 {
+		compiled := &template.Workflow
+		compileWorkflow(filePath, preprocessor, tplCopy.Options, compiled, tplCopy.Options.WorkflowLoader)
+		template.CompiledWorkflow = compiled
+		template.CompiledWorkflow.Options = tplCopy.Options
+	} else if err := template.compileProtocolRequests(template.Options); err != nil {
+		return nil, true, err
+	} else if template.Executer != nil {
+		if err := template.Executer.Compile(); err != nil {
+			return nil, true, errors.Wrap(err, "could not compile request")
+		}
+		template.TotalRequests = template.Executer.Requests()
+	}
+
+	if isCachedTemplateValid(template) {
+		// options.Logger.Error().Msgf("returning cached template %s after recompiling %d requests", tplCopy.Options.TemplateID, tplCopy.Requests())
+		return template, true, nil
+	}
+
+	return nil, false, nil
+}
+
+// isGlobalMatchersEnabled checks if any of requests in the template
+// have global matchers enabled. It iterates through all requests and
+// returns true if at least one request has global matchers enabled;
+// otherwise, it returns false. If global matchers templates are not
+// enabled in the options, the method will immediately return false.
+//
+// Note: This method only checks the `RequestsHTTP`
+// field of the template, which is specific to http-protocol-based
+// templates.
+//
+// TODO: support all protocols.
+func (template *Template) isGlobalMatchersEnabled() bool {
+	caps := CapabilitiesFromOptions(template.Options.Options)
+	if !caps.Has(CapabilityGlobalMatchers) {
+		return false
+	}
+
+	return template.requiresGlobalMatchers()
+}
+
+// parseSelfContainedRequests parses the self contained template requests.
+func (template *Template) parseSelfContainedRequests() {
+	if template.Signature.Value.String() != "" {
+		for _, request := range template.RequestsHTTP {
+			request.Signature = template.Signature
+		}
+	}
+	if !template.SelfContained {
+		return
+	}
+	for _, request := range template.RequestsHTTP {
+		request.SelfContained = true
+	}
+	for _, request := range template.RequestsNetwork {
+		request.SelfContained = true
+	}
+	for _, request := range template.RequestsHeadless {
+		request.SelfContained = true
+	}
+}
+
+// Requests returns the total request count for the template
+func (template *Template) Requests() int {
+	return len(template.RequestsDNS) +
+		len(template.RequestsHTTP) +
+		len(template.RequestsFile) +
+		len(template.RequestsNetwork) +
+		len(template.RequestsHeadless) +
+		len(template.Workflows) +
+		len(template.RequestsSSL) +
+		len(template.RequestsWebsocket) +
+		len(template.RequestsWHOIS) +
+		len(template.RequestsCode) +
+		len(template.RequestsJavascript)
+}
+
+// compileProtocolRequests compiles all the protocol requests for the template
+func (template *Template) compileProtocolRequests(options *protocols.ExecutorOptions) error {
+	templateRequests := template.Requests()
+
+	if templateRequests == 0 {
+		return fmt.Errorf("no requests defined for %s", template.ID)
+	}
+
+	if options.Options.OfflineHTTP {
+		return template.compileOfflineHTTPRequest(options)
+	}
+	http.KeepRawResponses(template.RequestsHTTP, options.Flow)
+
+	var requests []protocols.Request
+	caps := CapabilitiesFromOptions(options.Options)
+
+	if template.hasMultipleRequests() {
+		// when multiple requests are present preserve the order of requests and protocols
+		// which is already done during unmarshalling
+		requests = template.RequestsQueue
+		// strip code requests from the multiprotocol queue unless code templates
+		// are enabled (-code), mirroring the single-protocol gate so it also
+		// applies to the SDK/direct Parse path.
+		if !options.Options.EnableCodeTemplates {
+			requests = filterOutCodeRequests(requests)
+		}
+		if options.Flow == "" {
+			options.IsMultiProtocol = true
+		}
+	} else {
+		if template.HasDNSRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsDNS)...)
+		}
+		if template.HasFileRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsFile)...)
+		}
+		if template.HasNetworkRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsNetwork)...)
+		}
+		if template.HasHTTPRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsHTTP)...)
+		}
+		if template.HasHeadlessRequest() && caps.Has(CapabilityHeadless) {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsHeadless)...)
+		}
+		if template.HasSSLRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsSSL)...)
+		}
+		if template.HasWebsocketRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsWebsocket)...)
+		}
+		if template.HasWHOISRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsWHOIS)...)
+		}
+		if template.HasCodeRequest() && caps.Has(CapabilityCode) {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsCode)...)
+		}
+		if template.HasJavascriptRequest() {
+			requests = append(requests, template.convertRequestToProtocolsRequest(template.RequestsJavascript)...)
+		}
+	}
+	var err error
+	template.Executer, err = tmplexec.NewTemplateExecuter(requests, options)
+	return err
+}
+
+// filterOutCodeRequests returns the requests with all code-protocol requests
+// removed. Used to enforce the -code gate on the multiprotocol compile path.
+func filterOutCodeRequests(requests []protocols.Request) []protocols.Request {
+	filtered := make([]protocols.Request, 0, len(requests))
+	for _, req := range requests {
+		if req.Type() == templateTypes.CodeProtocol {
+			continue
+		}
+		filtered = append(filtered, req)
+	}
+	return filtered
+}
+
+// convertRequestToProtocolsRequest is a convenience wrapper to convert
+// arbitrary interfaces which are slices of requests from the template to a
+// slice of protocols.Request interface items.
+func (template *Template) convertRequestToProtocolsRequest(requests interface{}) []protocols.Request {
+	switch reflect.TypeOf(requests).Kind() {
+	case reflect.Slice:
+		s := reflect.ValueOf(requests)
+
+		requestSlice := make([]protocols.Request, s.Len())
+		for i := 0; i < s.Len(); i++ {
+			value := s.Index(i)
+			valueInterface := value.Interface()
+			requestSlice[i] = valueInterface.(protocols.Request)
+		}
+		return requestSlice
+	}
+	return nil
+}
+
+// compileOfflineHTTPRequest iterates all requests if offline http mode is
+// specified and collects all matchers for all the base request templates
+// (those with URL {{BaseURL}} and it's slash variation.)
+func (template *Template) compileOfflineHTTPRequest(options *protocols.ExecutorOptions) error {
+	operatorsList := []*operators.Operators{}
+
+mainLoop:
+	for _, req := range template.RequestsHTTP {
+		hasPaths := len(req.Path) > 0
+		if !hasPaths {
+			break mainLoop
+		}
+		for _, path := range req.Path {
+			pathIsBaseURL := stringsutil.EqualFoldAny(path, "{{BaseURL}}", "{{BaseURL}}/", "/")
+			if !pathIsBaseURL {
+				break mainLoop
+			}
+		}
+		operatorsList = append(operatorsList, &req.Operators)
+	}
+	if len(operatorsList) > 0 {
+		options.Operators = operatorsList
+		var err error
+		template.Executer, err = tmplexec.NewTemplateExecuter([]protocols.Request{&offlinehttp.Request{}}, options)
+		if err != nil {
+			// it seems like flow executor cannot be used for offline http matching (ex:http(1) && http(2))
+			return ErrIncompatibleWithOfflineMatching
+		}
+		return err
+	}
+
+	return ErrIncompatibleWithOfflineMatching
+}
+
+// ParseTemplateFromReader parses a template from an [io.Reader] with optional
+// preprocessing.
+func ParseTemplateFromReader(reader io.Reader, preprocessor Preprocessor, options *protocols.ExecutorOptions) (*Template, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	template, _, err := parseTemplateFromData(data, preprocessor, options)
+	return template, err
+}
+
+// parseTemplateFromData parses and compiles template data while also returning
+// the prepared pre-compilation template definition that is safe to cache.
+func parseTemplateFromData(data []byte, preprocessor Preprocessor, options *protocols.ExecutorOptions) (*Template, *Template, error) {
+	// a preprocessor is a variable like
+	// {{randstr}} which is replaced before unmarshalling
+	// as it is known to be a random static value per template
+	hasPreprocessor := hasTemplatePreprocessor(data, preprocessor)
+	allPreprocessors := getPreprocessors(preprocessor)
+
+	if !hasPreprocessor {
+		// if no preprocessors exists parse template and exit
+		template, err := parseTemplateNoVerify(data, options)
+		if err != nil {
+			return nil, nil, err
+		}
+		cacheableTemplate := cloneTemplate(template)
+		if err := verifyAndCompileTemplate(template, data); err != nil {
+			return nil, nil, err
+		}
+		if !template.Verified && len(template.Workflows) == 0 {
+			if config.DefaultConfig.LogAllEvents {
+				gologger.DefaultLogger.Print().Msgf("[%v] Template %s is not signed or tampered\n", aurora.Yellow("WRN").String(), template.ID)
+			}
+		}
+		return template, cacheableTemplate, nil
+	}
+
+	// if preprocessor is required / exists in this template
+	// expand all preprocessors, parse once, then verify against original data
+	generatedConstants := map[string]interface{}{}
+
+	// ==== execute preprocessors ======
+	processedData := data
+	for _, v := range allPreprocessors {
+		var replaced map[string]interface{}
+		processedData, replaced = v.ProcessNReturnData(processedData)
+		// preprocess kind of act like a constant and are generated while loading
+		// and stay constant for the template lifecycle
+		generatedConstants = generators.MergeMaps(generatedConstants, replaced)
+	}
+
+	template, err := parseTemplateNoVerify(processedData, options)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// add generated constants to constants map and executer options
+	template.Constants = generators.MergeMaps(template.Constants, generatedConstants)
+	template.Options.Constants = template.Constants
+	cacheableTemplate := cloneTemplate(template)
+	if err := verifyAndCompileTemplate(template, data); err != nil {
+		return nil, nil, err
+	}
+
+	if !template.Verified && len(template.Workflows) == 0 {
+		// workflows are not signed by default
+		if config.DefaultConfig.LogAllEvents {
+			gologger.DefaultLogger.Print().Msgf("[%v] Template %s is not signed or tampered\n", aurora.Yellow("WRN").String(), template.ID)
+		}
+	}
+
+	return template, cacheableTemplate, nil
+}
+
+func hasTemplatePreprocessor(data []byte, preprocessor Preprocessor) bool {
+	for _, candidate := range getPreprocessors(preprocessor) {
+		if candidate.Exists(data) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// verifyAndCompileTemplate keeps signature verification before protocol
+// compilation because JavaScript init blocks execute during compilation.
+func verifyAndCompileTemplate(template *Template, data []byte) error {
+	applyTemplateVerification(template, data)
+
+	return compileTemplate(template)
+}
+
+// parseTemplateNoVerify parses the template without applying any verification.
+func parseTemplateNoVerify(data []byte, srcOptions *protocols.ExecutorOptions) (*Template, error) {
+	template := &Template{}
+
+	var err error
+
+	switch config.GetTemplateFormatFromExt(template.Path) {
+	case config.JSON:
+		err = json.Unmarshal(data, template)
+	case config.YAML:
+		err = yaml.Unmarshal(data, template)
+	default:
+		// assume its yaml
+		if err = yaml.Unmarshal(data, template); err != nil {
+			return nil, err
+		}
+	}
+
+	if err != nil {
+		return nil, errkit.Wrapf(err, "failed to parse %s", template.Path)
+	}
+
+	return prepareTemplate(template, srcOptions)
+}
+
+func prepareTemplate(template *Template, srcOptions *protocols.ExecutorOptions) (*Template, error) {
+	// Create a copy of the options specifically for this template.
+	options := srcOptions.Copy()
+
+	if utils.IsBlank(template.Info.Name) {
+		return nil, errors.New("no template name field provided")
+	}
+
+	if template.Info.Authors.IsEmpty() {
+		return nil, errors.New("no template author field provided")
+	}
+
+	numberOfWorkflows := len(template.Workflows)
+	if numberOfWorkflows > 0 && numberOfWorkflows != template.Requests() {
+		return nil, errors.New("workflows cannot have other protocols")
+	}
+
+	// use default unknown severity
+	if len(template.Workflows) == 0 {
+		if template.Info.SeverityHolder.Severity == severity.Undefined {
+			// set unknown severity with counter and forced warning
+			template.Info.SeverityHolder.Severity = severity.Unknown
+			if options.Options.Validate {
+				// when validating return error
+				return nil, errors.New("no template severity field provided")
+			}
+		}
+	}
+
+	// Setting up variables regarding template metadata
+	options.TemplateID = template.ID
+	options.TemplateInfo = template.Info
+	options.StopAtFirstMatch = template.StopAtFirstMatch
+
+	if template.Variables.Len() > 0 {
+		options.Variables = template.Variables
+	}
+
+	// if more than 1 request per protocol exist we add request id to protocol request
+	// since in template context we have proto_prefix for each protocol it is overwritten
+	// if request id is not present
+	template.validateAllRequestIDs()
+
+	// create empty context args for template scope
+	options.CreateTemplateCtxStore()
+	options.ProtocolType = template.Type()
+	options.Constants = template.Constants
+	// initialize the js compiler if missing
+	if options.JsCompiler == nil {
+		options.JsCompiler = GetJsCompiler() // this is a singleton
+	}
+
+	template.Options = options
+
+	// If no requests, and it is also not a workflow, return error.
+	if template.Requests() == 0 {
+		return nil, fmt.Errorf("no requests defined for %s", template.ID)
+	}
+
+	// load `flow` and `source` in code protocol from file
+	// if file is referenced instead of actual source code
+	if err := template.ImportFileRefs(template.Options); err != nil {
+		return nil, errkit.Wrapf(err, "failed to load file refs for %s", template.ID)
+	}
+
+	return template, nil
+}
+
+// compileTemplate prepares a parsed template for execution after its signature
+// verification result is available to protocol compilers.
+func compileTemplate(template *Template) error {
+	if err := template.compileProtocolRequests(template.Options); err != nil {
+		return err
+	}
+
+	if template.Executer != nil {
+		if err := template.Executer.Compile(); err != nil {
+			return errors.Wrap(err, "could not compile request")
+		}
+
+		template.TotalRequests = template.Executer.Requests()
+	}
+
+	if template.Executer == nil && template.CompiledWorkflow == nil {
+		return ErrCreateTemplateExecutor
+	}
+
+	template.parseSelfContainedRequests()
+
+	if err := template.validateLLMSoleMatcher(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// applyTemplateVerification verifies a parsed template against the provided data.
+func applyTemplateVerification(template *Template, data []byte) {
+	if template == nil || template.Options == nil {
+		return
+	}
+
+	options := template.Options
+	verificationDigest, digestErr := templateVerificationDigest(data, template)
+	template.verificationDigest = verificationDigest
+
+	// index.gob is an unauthenticated local file. A forged entry can pair
+	// Verified=true with a trusted fingerprint and a digest of the
+	// unsigned payload, so never copy a cached verdict from it. Only
+	// verdicts this process computed are reused. Unsigned templates still
+	// short-circuit in ExtractSignatureAndContent with no ECDSA.
+	verifier := templateVerifier(template, data, verificationDigest, digestErr == nil)
+
+	template.Verified = verifier != nil
+	if template.Verified {
+		template.TemplateVerifier = verifier.Identifier()
+		template.verifierFingerprint = verifier.Fingerprint()
+	}
+
+	options.TemplateVerifier = template.TemplateVerifier
+	// Mirror verification onto options for code and JavaScript execution.
+	options.Verified = template.Verified
+
+	//nolint
+	if !(template.Verified && verifier.Identifier() == "projectdiscovery/nuclei-templates") {
+		template.Options.RawTemplate = data
+	}
+}
+
+// verifiedTemplatesCacheSize stays above the number of signed templates in
+// nuclei-templates so loading the whole set again does not evict its own
+// entries.
+const verifiedTemplatesCacheSize = 1 << 15
+
+// verifiedTemplates maps the verification digest of a template that passed
+// signature verification in this process to the verifier that accepted it.
+// It lets a process that loads the same templates several times (for example
+// one SDK engine per scan) run the ECDSA check once per content. It is
+// memory-only, so a verdict can never come from a file on disk. lru.New only
+// fails for a non-positive size.
+var verifiedTemplates, _ = lru.New[[sha256.Size]byte, *signer.TemplateSigner](verifiedTemplatesCacheSize)
+
+// templateVerifier returns the default verifier that accepts data, or nil when
+// none does. Only successful verifications are cached: a verifier added later
+// may accept a template that failed before.
+func templateVerifier(template *Template, data []byte, digest [sha256.Size]byte, cacheable bool) *signer.TemplateSigner {
+	if cacheable {
+		// The verifier list can change at runtime, so a verdict from a
+		// verifier that is no longer listed does not count.
+		if verifier, ok := verifiedTemplates.Get(digest); ok && slices.Contains(signer.DefaultTemplateVerifiers, verifier) {
+			return verifier
+		}
+	}
+
+	for _, verifier := range signer.DefaultTemplateVerifiers {
+		verified, _ := verifier.Verify(data, template)
+		if config.DefaultConfig.LogAllEvents {
+			gologger.Verbose().Msgf("template %v verified by %s : %v", template.ID, verifier.Identifier(), verified)
+		}
+
+		if verified {
+			if cacheable {
+				verifiedTemplates.Add(digest, verifier)
+			}
+			return verifier
+		}
+	}
+
+	return nil
+}
+
+// ContentDigest returns the digest used to bind cached signature
+// verification to template and imported-file contents.
+func (template *Template) ContentDigest() [sha256.Size]byte {
+	return template.verificationDigest
+}
+
+// VerifierFingerprint returns the public-key fingerprint for the verifier that
+// authenticated this template.
+func (template *Template) VerifierFingerprint() [sha256.Size]byte {
+	return template.verifierFingerprint
+}
+
+func templateVerificationDigest(data []byte, template *Template) ([sha256.Size]byte, error) {
+	componentDigests := make([]byte, 0, sha256.Size*(len(template.GetFileImports())+1))
+	dataDigest := sha256.Sum256(data)
+	componentDigests = append(componentDigests, dataDigest[:]...)
+
+	importedContents, complete := template.GetFileImportContents()
+	if !complete {
+		return [sha256.Size]byte{}, errors.New("imported-file content snapshot is incomplete")
+	}
+
+	for _, contents := range importedContents {
+		fileDigest := sha256.Sum256(contents)
+		componentDigests = append(componentDigests, fileDigest[:]...)
+	}
+
+	return sha256.Sum256(componentDigests), nil
+}
+
+// isCachedTemplateValid validates that a cached template is still usable after
+// option updates
+func isCachedTemplateValid(template *Template) bool {
+	// no requests or workflows
+	if template.Requests() == 0 && len(template.Workflows) == 0 {
+		return false
+	}
+
+	// options not initialized
+	if template.Options == nil {
+		return false
+	}
+
+	// executer not available for non-workflow template
+	if len(template.Workflows) == 0 && template.Executer == nil {
+		return false
+	}
+
+	// compiled workflow not available
+	if len(template.Workflows) > 0 && template.CompiledWorkflow == nil {
+		return false
+	}
+
+	// template ID mismatch
+	if template.Options.TemplateID != template.ID {
+		return false
+	}
+
+	// executer exists but no requests or flow available
+	if template.Executer != nil {
+		// NOTE(dwisiswant0): This is a basic sanity check since we can't access
+		// private fields, but we can check requests tho
+		if template.Requests() == 0 && template.Options.Flow == "" {
+			return false
+		}
+	}
+
+	if template.Options.Options == nil {
+		return false
+	}
+
+	return true
+}
+
+var (
+	jsCompiler     *compiler.Compiler
+	jsCompilerOnce = sync.OnceFunc(func() {
+		jsCompiler = compiler.New()
+	})
+)
+
+func GetJsCompiler() *compiler.Compiler {
+	jsCompilerOnce()
+	return jsCompiler
+}

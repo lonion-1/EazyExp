@@ -1,0 +1,66 @@
+version: 2
+project_name: certstream-server-go
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - main: ./cmd/certstream-server-go
+    ldflags: -s -w -X github.com/d-Rickyy-b/certstream-server-go/internal/config.Version={{.Version}}
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - "386"
+      - amd64
+      - arm
+      - arm64
+    ignore:
+      - goos: darwin
+        goarch: "386"
+      - goos: darwin
+        goarch: arm
+      - goos: windows
+        goarch: arm
+      - goos: windows
+        goarch: arm64
+      - goos: windows
+        goarch: "386"
+checksum:
+  name_template: "{{.ProjectName}}_{{.Version}}_checksums.txt"
+changelog:
+  disable: true
+
+dockers_v2:
+  - images:
+      - "0rickyy0/{{.ProjectName}}"
+      - "ghcr.io/d-rickyy-b/{{.ProjectName}}"
+    dockerfile: docker/Dockerfile.goreleaser
+    tags:
+      - '{{ if eq .Branch "dev" }}dev{{ else }}{{ .Tag }}{{ end }}'
+      - '{{ if and (ne .Branch "dev") (not .Prerelease) }}latest{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    extra_files:
+      - config.docker.yaml
+    labels:
+      "org.opencontainers.image.title": "{{.ProjectName}}"
+      "org.opencontainers.image.description": "Certstream server written in Go"
+      "org.opencontainers.image.created": "{{.Date}}"
+      "org.opencontainers.image.name": "{{.ProjectName}}"
+      "org.opencontainers.image.revision": "{{.FullCommit}}"
+      "org.opencontainers.image.version": "{{.Version}}"
+      "org.opencontainers.image.source": "https://github.com/d-Rickyy-b/certstream-server-go"
+
+archives:
+  - formats: ["binary"]
+    name_template: >-
+      {{- .ProjectName }}_
+      {{- .Version}}_
+      {{- if eq .Os "darwin" }}macOS{{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "386" }}i386{{- else }}{{ .Arch }}{{ end }}

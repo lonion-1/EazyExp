@@ -1,0 +1,193 @@
+package http
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/projectdiscovery/fastdialer/fastdialer"
+	commoninteractsh "github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/raw"
+	"github.com/projectdiscovery/nuclei/v3/pkg/types/nucleierr"
+	"github.com/projectdiscovery/retryablehttp-go"
+	"github.com/projectdiscovery/utils/errkit"
+	iputil "github.com/projectdiscovery/utils/ip"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+)
+
+var (
+	// @Host:target overrides the input target with the annotated one (similar to self-contained requests)
+	reHostAnnotation = regexp.MustCompile(`(?m)^@Host:\s*(.+)\s*$`)
+	// @tls-sni:target overrides the input target with the annotated one
+	// special values:
+	// request.host: takes the value from the host header
+	// target: overrides with the specific value
+	reSniAnnotation = regexp.MustCompile(`(?m)^@tls-sni:\s*(.+)\s*$`)
+	// @timeout:duration overrides the input timeout with a custom duration
+	reTimeoutAnnotation = regexp.MustCompile(`(?m)^@timeout:\s*(.+)\s*$`)
+	// @once sets the request to be executed only once for a specific URL
+	reOnceAnnotation = regexp.MustCompile(`(?m)^@once\s*$`)
+	// maxAnnotationTimeout is the maximum timeout allowed for @timeout
+	// annotations to prevent DoS attacks via extremely large timeout values.
+	maxAnnotationTimeout = 5 * time.Minute
+	// ErrTimeoutAnnotationDeadline is the error returned when a specific amount of time was exceeded for a request
+	// which was allotted using @timeout annotation this usually means that vulnerability was not found
+	// in rare case it could also happen due to network congestion
+	// the assigned class is TemplateLogic since this in almost every case means that server is not vulnerable
+	ErrTimeoutAnnotationDeadline = errkit.New("timeout annotation deadline exceeded").SetKind(nucleierr.ErrTemplateLogic).Build()
+	// ErrRequestTimeoutDeadline is the error returned when a specific amount of time was exceeded for a request
+	// this happens when the request execution exceeds allotted time
+	ErrRequestTimeoutDeadline = errkit.New("request timeout deadline exceeded when notimeout is set").SetKind(errkit.ErrKindDeadline).Build()
+)
+
+type flowMark int
+
+const (
+	Once flowMark = iota
+)
+
+// parseFlowAnnotations and override requests flow
+func parseFlowAnnotations(rawRequest string) (flowMark, bool) {
+	var fm flowMark
+	// parse request for known override annotations
+	var hasFlowOverride bool
+	annotations, _ := raw.SplitAnnotations(rawRequest)
+	// @once
+	if reOnceAnnotation.MatchString(annotations) {
+		fm = Once
+		hasFlowOverride = true
+	}
+
+	return fm, hasFlowOverride
+}
+
+// hasTimeoutAnnotation reports whether rawRequest has a @timeout annotation.
+func hasTimeoutAnnotation(rawRequest string) bool {
+	annotations, _ := raw.SplitAnnotations(rawRequest)
+	return reTimeoutAnnotation.MatchString(annotations)
+}
+
+type annotationOverrides struct {
+	request *retryablehttp.Request
+	// timeout bounds the request once it is sent, and timeoutCause is the
+	// error it ends with.
+	timeout        time.Duration
+	timeoutCause   error
+	interactshURLs []string
+	err            error
+}
+
+// parseAnnotations and override requests settings
+func (r *Request) parseAnnotations(rawRequest string, request *retryablehttp.Request) (overrides annotationOverrides, modified bool) {
+	// rawRequest is rendered, so its headers and body can hold values taken
+	// from responses. Only the annotation lines may override the request.
+	annotations, _ := raw.SplitAnnotations(rawRequest)
+
+	// @Host:target
+	if hosts := reHostAnnotation.FindStringSubmatch(annotations); len(hosts) > 0 {
+		value := strings.TrimSpace(hosts[1])
+		// handle scheme
+		switch {
+		case stringsutil.HasPrefixI(value, "http://"):
+			request.Scheme = "http"
+		case stringsutil.HasPrefixI(value, "https://"):
+			request.Scheme = "https"
+		}
+
+		value = stringsutil.TrimPrefixAny(value, "http://", "https://")
+
+		if isHostPort(value) {
+			request.URL.Host = value
+		} else {
+			hostPort := value
+			port := request.Port()
+			if port != "" {
+				hostPort = net.JoinHostPort(hostPort, port)
+			}
+			request.URL.Host = hostPort
+		}
+		modified = true
+	}
+
+	// @tls-sni:target
+	if hosts := reSniAnnotation.FindStringSubmatch(annotations); len(hosts) > 0 {
+		value := strings.TrimSpace(hosts[1])
+		value = stringsutil.TrimPrefixAny(value, "http://", "https://")
+
+		var literal bool
+		switch value {
+		case "request.host":
+			value = request.Host
+		case "interactsh-url":
+			if r.options == nil || r.options.Interactsh == nil {
+				overrides.err = commoninteractsh.ErrInteractshClientNotInitialized
+				overrides.request = request
+				return overrides, true
+			}
+			interactshURL, err := r.options.Interactsh.NewURLWithData("interactsh-url")
+			if err != nil {
+				overrides.err = err
+				overrides.request = request
+				return overrides, true
+			}
+			value = interactshURL
+			overrides.interactshURLs = append(overrides.interactshURLs, interactshURL)
+		default:
+			literal = true
+		}
+		ctx := context.WithValue(request.Context(), fastdialer.SniName, value)
+		request = request.Clone(ctx)
+
+		if literal {
+			request.TLS = &tls.ConnectionState{ServerName: value}
+		}
+		modified = true
+	}
+
+	// @timeout:duration
+	// The timeout is only recorded here. executeRequest starts it after the
+	// rate-limit and body-budget waits, so those waits do not use it up (#8176).
+	// NoTimeout leaves the client without the HTTP timeout, so every request
+	// records one: the default, unless a valid annotation replaces it.
+	if r.connConfiguration.NoTimeout {
+		modified = true
+		overrides.timeout, overrides.timeoutCause = r.options.Options.GetTimeouts().HttpTimeout, ErrRequestTimeoutDeadline
+
+		if duration := reTimeoutAnnotation.FindStringSubmatch(annotations); len(duration) > 0 {
+			value := strings.TrimSpace(duration[1])
+			parsedTimeout, err := time.ParseDuration(value)
+			// A timeout that does not parse or is not positive keeps the default.
+			if err == nil && parsedTimeout > 0 {
+				// Cap at maximum allowed timeout to prevent DoS via extremely large timeout values
+				if parsedTimeout > maxAnnotationTimeout {
+					parsedTimeout = maxAnnotationTimeout
+				}
+
+				overrides.timeout, overrides.timeoutCause = parsedTimeout, ErrTimeoutAnnotationDeadline
+				ctx := request.Context()
+				// add timeout value to context
+				ctx = context.WithValue(ctx, httpclientpool.WithCustomTimeout{}, httpclientpool.WithCustomTimeout{Timeout: parsedTimeout})
+				request = request.Clone(ctx)
+			}
+		}
+	}
+
+	overrides.request = request
+
+	return
+}
+
+func isHostPort(value string) bool {
+	_, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return false
+	}
+	if !iputil.IsPort(port) {
+		return false
+	}
+	return true
+}

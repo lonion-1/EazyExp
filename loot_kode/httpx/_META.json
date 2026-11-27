@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T06:50:39.948516+00:00",
+  "name": "httpx",
+  "repo": "projectdiscovery/httpx",
+  "branch": "dev",
+  "license": "MIT",
+  "stars": 10663,
+  "commit_sha": "f4c895f8540651c2377d21a9823331c9a47549a8",
+  "last_commit_date": "2026-11-26T15:40:29Z",
+  "files_count": 151,
+  "total_bytes": 799248,
+  "output_dir": "./loot_kode/httpx"
+}

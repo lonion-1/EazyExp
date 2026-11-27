@@ -1,0 +1,158 @@
+version: "2"
+run:
+  modules-download-mode: readonly
+  tests: true
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - canonicalheader
+    - containedctx
+    - contextcheck
+    - copyloopvar
+    - decorder
+    #- depguard
+    - dogsled
+    - dupl
+    - dupword
+    - durationcheck
+    - embeddedstructfieldcheck
+    - err113
+    - errcheck
+    - errchkjson
+    - errname
+    - errorlint
+    - exhaustive
+    # - exhaustruct
+    - gochecknoinits
+    - gochecksumtype
+    - goconst
+    - gocritic
+    # - gocyclo
+    # - godoclint
+    - godot
+    # - godox
+    - gomoddirectives
+    - gomodguard_v2
+    - goprintffuncname
+    - gosec
+    - govet
+    - grouper
+    - iface
+    - importas
+    - inamedparam
+    - ineffassign
+    - interfacebloat
+    - intrange
+    - iotamixing
+    - ireturn
+    - lll
+    - loggercheck
+    - maintidx
+    - makezero
+    - mirror
+    - misspell
+    - modernize
+    - nakedret
+    - nestif
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - nlreturn
+    - noctx
+    - nolintlint
+    - nosprintfhostport
+    #- paralleltest
+    - perfsprint
+    - prealloc
+    - predeclared
+    - promlinter
+    - reassign
+    - recvcheck
+    - revive
+    - sloglint
+    - staticcheck
+    - tagalign
+    # - tagliatelle
+    - thelper
+    - tparallel
+    - unconvert
+    - unparam
+    - unused
+    - usestdlibvars
+    - usetesting
+    - varnamelen
+    - wastedassign
+    - whitespace
+    - wrapcheck
+    - wsl_v5
+  settings:
+    lll:
+      line-length: 160
+    nlreturn:
+      block-size: 2
+    varnamelen:
+      ignore-decls:
+        - w io.Writer
+        - w io.WriteCloser
+        - w http.ResponseWriter
+        - r *http.Request
+        - r chi.Router
+        - r *chi.Mux
+        - i int
+        - ip net.IP
+        - ip string
+        - ok bool
+        - err error
+        - ctx context.Context
+        - v *viper.Viper
+        - v uint64
+        - c *client
+        - cs *Certstream
+        - k x509.KeyUsage
+    wsl_v5:
+      allow-first-in-block: true
+      allow-whole-block: true
+      branch-max-lines: 2
+      disable:
+        - decl
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - nlreturn
+          - wsl_v5
+          - varnamelen
+          - goconst
+          - err113
+          - gosec
+          - dupl
+        path: _test\.go
+      - linters:
+          - gochecknoinits
+        path: ^cmd/
+formatters:
+  enable:
+    - gofumpt
+    - goimports
+  settings:
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

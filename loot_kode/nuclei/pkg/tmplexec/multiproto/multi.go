@@ -1,0 +1,166 @@
+package multiproto
+
+import (
+	"strconv"
+	"sync/atomic"
+
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/scan"
+	"github.com/projectdiscovery/nuclei/v3/pkg/tmplexec/utils"
+	mapsutil "github.com/projectdiscovery/utils/maps"
+)
+
+// Mutliprotocol is a template executer engine that executes multiple protocols
+// with logic in between
+type MultiProtocol struct {
+	requests     []protocols.Request
+	options      *protocols.ExecutorOptions
+	results      *atomic.Bool
+	readOnlyArgs map[string]interface{} // readOnlyArgs are readonly args that are available after compilation
+	readOnlyVars map[string]interface{} // readOnlyVars are the template-owned subset of readOnlyArgs.
+}
+
+// NewMultiProtocol creates a new multiprotocol template engine from a list of requests
+func NewMultiProtocol(requests []protocols.Request, options *protocols.ExecutorOptions, results *atomic.Bool) *MultiProtocol {
+	if results == nil {
+		results = &atomic.Bool{}
+	}
+	return &MultiProtocol{requests: requests, options: options, results: results}
+}
+
+// Compile engine specific compilation
+func (m *MultiProtocol) Compile() error {
+	optionVars := generators.BuildPayloadFromOptions(m.options.Options)
+	constants := m.options.Constants
+	scope := m.options.NewVariablesScope(constants, optionVars)
+	evaluation := m.options.Variables.EvaluateScope(scope)
+	allVars := generators.MergeMaps(evaluation.Values, constants, optionVars)
+
+	templateVariables := make(map[string]interface{}, len(evaluation.TemplateValues))
+	for key := range evaluation.TemplateValues {
+		if _, ok := constants[key]; ok {
+			continue
+		}
+
+		if _, ok := optionVars[key]; ok {
+			continue
+		}
+
+		if value, ok := allVars[key]; ok {
+			templateVariables[key] = value
+		}
+	}
+
+	m.readOnlyArgs = allVars
+	m.readOnlyVars = templateVariables
+
+	// no need to load files since they are done at template level
+	return nil
+}
+
+// ExecuteWithResults executes the template and returns results
+func (m *MultiProtocol) ExecuteWithResults(ctx *scan.ScanContext) error {
+	select {
+	case <-ctx.Context().Done():
+		return ctx.Context().Err()
+	default:
+	}
+
+	// put all readonly args into template context
+	m.options.GetTemplateCtx(ctx.Input.MetaInput).Merge(m.readOnlyArgs)
+	m.options.GetTemplateCtx(ctx.Input.MetaInput).MergeTemplateVariables(m.readOnlyVars)
+
+	// add all input args to template context
+	ctx.Input.ForEach(func(key string, value interface{}) {
+		m.options.GetTemplateCtx(ctx.Input.MetaInput).Set(key, value)
+	})
+
+	previous := mapsutil.NewSyncLockMap[string, any]()
+
+	// template context: contains values extracted using `internal` extractor from previous protocols
+	// these values are extracted from each protocol in queue and are passed to next protocol in queue
+	// instead of adding separator field to handle such cases these values are appended to `dynamicValues` (which are meant to be used in workflows)
+	// this makes it possible to use multi protocol templates in workflows
+	// Note: internal extractor values take precedence over dynamicValues from workflows (i.e other templates in workflow)
+
+	// execute all protocols in the queue
+	for _, req := range m.requests {
+		select {
+		case <-ctx.Context().Done():
+			return ctx.Context().Err()
+		default:
+		}
+		inputItem := ctx.Input.Clone()
+		if m.options.InputHelper != nil && ctx.Input.MetaInput.Input != "" && !utils.HasOfflineHTTPResponse(ctx.Input.MetaInput, req.Type()) {
+			if inputItem.MetaInput.Input = m.options.InputHelper.TransformPinned(inputItem.MetaInput.Input, inputItem.MetaInput.CustomIP, req.Type()); inputItem.MetaInput.Input == "" {
+				return nil
+			}
+		}
+		// FIXME: this hack of using hash to get templateCtx has known issues scan context based approach should be adopted ASAP
+		values := m.options.GetTemplateCtx(inputItem.MetaInput).GetAll()
+		err := req.ExecuteWithResults(inputItem, output.InternalEvent(values), output.InternalEvent(previous.GetAll()), func(event *output.InternalWrappedEvent) {
+			if event == nil {
+				return
+			}
+
+			utils.FillPreviousEvent(req.GetID(), event, previous)
+
+			// log event and generate result for the event
+			ctx.LogEvent(event)
+			// export dynamic values from operators (i.e internal:true)
+			if event.OperatorsResult != nil && len(event.OperatorsResult.DynamicValues) > 0 {
+				for k, v := range event.OperatorsResult.DynamicValues {
+					// TBD: iterate-all is only supported in `http` protocol
+					// we either need to add support for iterate-all in other protocols or implement a different logic (specific to template context)
+					// currently if dynamic value array only contains one value we replace it with the value
+					if len(v) == 1 {
+						m.options.GetTemplateCtx(ctx.Input.MetaInput).Set(k, v[0])
+					} else {
+						// Note: if extracted value contains multiple values then they can be accessed by indexing
+						// ex: if values are dynamic = []string{"a","b","c"} then they are available as
+						// dynamic = "a" , dynamic1 = "b" , dynamic2 = "c"
+						// we intentionally omit first index for unknown situations (where no of extracted values are not known)
+						for i, val := range v {
+							if i == 0 {
+								m.options.GetTemplateCtx(ctx.Input.MetaInput).Set(k, val)
+							} else {
+								m.options.GetTemplateCtx(ctx.Input.MetaInput).Set(k+strconv.Itoa(i), val)
+							}
+						}
+					}
+				}
+			}
+
+			// evaluate all variables after execution of each protocol
+			scope := m.options.NewVariablesScope()
+			m.options.AddTemplateCtxToVariablesScope(ctx.Input.MetaInput, scope)
+			evaluation := m.options.Variables.EvaluateScope(scope)
+			templateCtx := m.options.GetTemplateCtx(ctx.Input.MetaInput)
+			templateCtx.Merge(evaluation.Values)
+			templateCtx.MergeTemplateVariables(evaluation.TemplateValues)
+		})
+
+		// a protocol's error is logged and the next protocol still runs, so that it emits its events (#5995)
+		// a cancelled scan is the exception: the loop returns the context error
+		if err != nil {
+			// the engine warns about the context error returned here, so a
+			// warning of our own would print the cancellation twice
+			ctxErr := ctx.Context().Err()
+			if ctxErr != nil {
+				//nolint:wrapcheck // the loop returns the context error unwrapped too, and the engine prints it as is
+				return ctxErr
+			}
+			// always log errors
+			utils.LogRequestError(ctx, m.options.TemplateID, err)
+		}
+	}
+
+	return nil
+}
+
+// Name of the template engine
+func (m *MultiProtocol) Name() string {
+	return "multiproto"
+}

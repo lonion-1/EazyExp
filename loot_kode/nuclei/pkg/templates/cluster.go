@@ -1,0 +1,486 @@
+package templates
+
+//nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v3/pkg/model"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/helpers/writer"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/catchall"
+	protocolUtils "github.com/projectdiscovery/nuclei/v3/pkg/protocols/utils"
+	"github.com/projectdiscovery/nuclei/v3/pkg/scan"
+	"github.com/projectdiscovery/nuclei/v3/pkg/templates/types"
+	cryptoutil "github.com/projectdiscovery/utils/crypto"
+)
+
+// Cluster clusters a list of templates into a lesser number if possible based
+// on the similarity between the sent requests.
+//
+// If the attributes match, multiple requests can be clustered into a single
+// request which saves time and network resources during execution.
+//
+// The clusterer goes through all the templates, looking for templates with a single
+// HTTP/DNS/TLS request to an endpoint (multiple requests aren't clustered as of now).
+//
+// All the templates are iterated and any templates with request that is identical
+// to the first individual request is compared for equality.
+// The equality check is performed as described below -
+//
+// Cases where clustering is not performed (request is considered different)
+//   - If request contains payloads,raw,body,unsafe,req-condition,name attributes
+//   - If an HTTP request sends race copies (race with a race_count above 0, outside a pipeline)
+//   - If request methods,max-redirects,disable-cookie,redirects,host-redirects,protocol-redirects are not equal
+//   - If request paths aren't identical.
+//   - If request headers aren't identical
+//   - Similarly for DNS, only identical DNS requests are clustered to a target.
+//   - Similarly for TLS, only identical TLS requests are clustered to a target.
+//
+// If multiple requests are identified as identical, they are appended to a slice.
+// Finally, the engine creates a single executer with a clusteredexecuter for all templates
+// in a cluster.
+func Cluster(list []*Template) [][]*Template {
+	http := make(map[uint64][]*Template)
+	dns := make(map[uint64][]*Template)
+	ssl := make(map[uint64][]*Template)
+
+	final := [][]*Template{}
+
+	// Split up templates that might be clusterable
+	for _, template := range list {
+		// it is not possible to cluster flow and multiprotocol due to dependent execution.
+		// Info placeholders are filled from the event a finding came from, and a
+		// cluster shares one event that already holds the first template's variables
+		// and extracted values, so a template with them runs on its own.
+		if template.Flow != "" || template.Options.IsMultiProtocol || template.Info.HasPlaceholders() {
+			final = append(final, []*Template{template})
+			continue
+		}
+
+		switch {
+		case len(template.RequestsDNS) == 1:
+			if template.RequestsDNS[0].IsClusterable() {
+				hash := template.RequestsDNS[0].TmplClusterKey()
+				if dns[hash] == nil {
+					dns[hash] = []*Template{}
+				}
+				dns[hash] = append(dns[hash], template)
+			} else {
+				final = append(final, []*Template{template})
+			}
+
+		case len(template.RequestsHTTP) == 1:
+			if template.RequestsHTTP[0].IsClusterable() {
+				hash := template.RequestsHTTP[0].TmplClusterKey()
+				if http[hash] == nil {
+					http[hash] = []*Template{}
+				}
+				http[hash] = append(http[hash], template)
+			} else {
+				final = append(final, []*Template{template})
+			}
+		case len(template.RequestsSSL) == 1:
+			if template.RequestsSSL[0].IsClusterable() {
+				hash := template.RequestsSSL[0].TmplClusterKey()
+				if ssl[hash] == nil {
+					ssl[hash] = []*Template{}
+				}
+				ssl[hash] = append(ssl[hash], template)
+			} else {
+				final = append(final, []*Template{template})
+			}
+		default:
+			final = append(final, []*Template{template})
+		}
+	}
+
+	// add all clusterd templates
+	for _, templates := range http {
+		final = append(final, templates)
+	}
+	for _, templates := range dns {
+		final = append(final, templates)
+	}
+	for _, templates := range ssl {
+		final = append(final, templates)
+	}
+
+	return final
+}
+
+// ClusterID transforms clusterization into a mathematical hash repeatable across executions with the same templates
+func ClusterID(templates []*Template) string {
+	allIDS := make([]string, len(templates))
+	for tplIndex, tpl := range templates {
+		allIDS[tplIndex] = tpl.ID
+	}
+	sort.Strings(allIDS)
+	ids := strings.Join(allIDS, ",")
+	return cryptoutil.SHA256Sum(ids)
+}
+
+// ClusterTemplates clusters templates and returns:
+// - the final list of templates (with clustered templates merged)
+// - the count of templates that were clustered
+// - a map of cluster ID to the original template IDs in each cluster
+func ClusterTemplates(templatesList []*Template, options *protocols.ExecutorOptions) ([]*Template, int, map[string][]string) {
+	if options.Options.OfflineHTTP || options.Options.DisableClustering {
+		return templatesList, 0, nil
+	}
+
+	var clusterCount int
+	clusterMappings := make(map[string][]string)
+
+	finalTemplatesList := make([]*Template, 0, len(templatesList))
+	clusters := Cluster(templatesList)
+	for _, cluster := range clusters {
+		if len(cluster) > 1 {
+			executerOpts := options
+			clusterID := fmt.Sprintf("cluster-%s", ClusterID(cluster))
+
+			// Collect all template IDs in this cluster
+			clusterTemplateIDs := make([]string, len(cluster))
+			for i, tpl := range cluster {
+				clusterTemplateIDs[i] = tpl.ID
+			}
+			clusterMappings[clusterID] = clusterTemplateIDs
+
+			for _, req := range cluster[0].RequestsDNS {
+				req.Options().TemplateID = clusterID
+			}
+			for _, req := range cluster[0].RequestsHTTP {
+				req.Options().TemplateID = clusterID
+			}
+			for _, req := range cluster[0].RequestsSSL {
+				req.Options().TemplateID = clusterID
+			}
+			executerOpts.TemplateID = clusterID
+			executer := NewClusterExecuter(cluster, executerOpts)
+			finalTemplatesList = append(finalTemplatesList, &Template{
+				ID:            clusterID,
+				RequestsDNS:   cluster[0].RequestsDNS,
+				RequestsHTTP:  cluster[0].RequestsHTTP,
+				RequestsSSL:   cluster[0].RequestsSSL,
+				Executer:      executer,
+				TotalRequests: executer.Requests(),
+			})
+			clusterCount += len(cluster)
+		} else {
+			finalTemplatesList = append(finalTemplatesList, cluster...)
+		}
+	}
+	return finalTemplatesList, clusterCount, clusterMappings
+}
+
+// ClusterExecuter executes a group of requests for a protocol for a clustered
+// request. It is different from normal executers since the original
+// operators are all combined and post processed after making the request.
+type ClusterExecuter struct {
+	requests     protocols.Request
+	operators    []*clusteredOperator
+	templateType types.ProtocolType
+	options      *protocols.ExecutorOptions
+}
+
+type clusteredOperator struct {
+	templateID   string
+	templatePath string
+	templateInfo model.Info
+	operator     *operators.Operators
+}
+
+var _ protocols.Executer = &ClusterExecuter{}
+
+// NewClusterExecuter creates a new request executer for list of requests
+func NewClusterExecuter(requests []*Template, options *protocols.ExecutorOptions) *ClusterExecuter {
+	executer := &ClusterExecuter{options: options}
+	if len(requests[0].RequestsDNS) == 1 {
+		executer.templateType = types.DNSProtocol
+		executer.requests = requests[0].RequestsDNS[0]
+	} else if len(requests[0].RequestsHTTP) == 1 {
+		executer.templateType = types.HTTPProtocol
+		executer.requests = requests[0].RequestsHTTP[0]
+	} else if len(requests[0].RequestsSSL) == 1 {
+		executer.templateType = types.SSLProtocol
+		executer.requests = requests[0].RequestsSSL[0]
+	}
+	appendOperator := func(req *Template, operator *operators.Operators) {
+		operator.TemplateID = req.ID
+		operator.ExcludeMatchers = options.ExcludeMatchers
+
+		executer.operators = append(executer.operators, &clusteredOperator{
+			operator:     operator,
+			templateID:   req.ID,
+			templateInfo: req.Info,
+			templatePath: req.Path,
+		})
+	}
+	for _, req := range requests {
+		switch executer.templateType {
+		case types.DNSProtocol:
+			if req.RequestsDNS[0].CompiledOperators != nil {
+				appendOperator(req, req.RequestsDNS[0].CompiledOperators)
+			}
+		case types.HTTPProtocol:
+			if req.RequestsHTTP[0].CompiledOperators != nil {
+				appendOperator(req, req.RequestsHTTP[0].CompiledOperators)
+			}
+		case types.SSLProtocol:
+			if req.RequestsSSL[0].CompiledOperators != nil {
+				appendOperator(req, req.RequestsSSL[0].CompiledOperators)
+			}
+		}
+	}
+	// Clustering runs after each template has already been compiled, and the
+	// engine executes this cluster without compiling it again. The shared
+	// request has to know about sibling operators before the first scan.
+	executer.markClusteredResponse()
+	return executer
+}
+
+// markClusteredResponse builds the full response when any clustered template
+// matches on it. Only the first template's operators live on the request.
+func (e *ClusterExecuter) markClusteredResponse() {
+	httpRequest, ok := e.requests.(*http.Request)
+	if !ok {
+		return
+	}
+	for _, operator := range e.operators {
+		if operator != nil && operator.operator != nil && operator.operator.NeedsResponse() {
+			httpRequest.RequireFullResponse()
+			return
+		}
+	}
+}
+
+// Compile compiles the execution generators preparing any requests possible.
+func (e *ClusterExecuter) Compile() error {
+	if err := e.requests.Compile(e.options); err != nil {
+		return err
+	}
+	// The compiled request is shared by every host worker. Mark it here, before
+	// any of those workers run, so the flag is not written during execution.
+	e.markClusteredResponse()
+	return nil
+}
+
+// Requests returns the total number of requests the rule will perform
+func (e *ClusterExecuter) Requests() int {
+	var count int
+	count += e.requests.Requests()
+	return count
+}
+
+// SelectedBy reports whether selection selects the template. A cluster is
+// selected when any of its members is.
+func (template *Template) SelectedBy(selection protocols.TemplateSelection) bool {
+	if cluster, ok := template.Executer.(*ClusterExecuter); ok {
+		return slices.ContainsFunc(cluster.operators, func(operator *clusteredOperator) bool {
+			return selection.Allows(operator.templatePath)
+		})
+	}
+	return selection.Allows(template.Path)
+}
+
+// TemplateIDs returns the IDs of the members selection selects; a nil
+// selection selects every member.
+func (e *ClusterExecuter) TemplateIDs(selection protocols.TemplateSelection) []string {
+	ids := make([]string, 0, len(e.operators))
+	for _, operator := range e.operators {
+		if selection == nil || selection.Allows(operator.templatePath) {
+			ids = append(ids, operator.templateID)
+		}
+	}
+	return ids
+}
+
+// TemplatePaths returns the paths of every member.
+func (e *ClusterExecuter) TemplatePaths() []string {
+	paths := make([]string, 0, len(e.operators))
+	for _, operator := range e.operators {
+		paths = append(paths, operator.templatePath)
+	}
+	return paths
+}
+
+// operatorsFor returns the members selected for input by per-target profiles.
+func (e *ClusterExecuter) operatorsFor(input *contextargs.MetaInput) []*clusteredOperator {
+	if e.options.TargetScope == nil {
+		return e.operators
+	}
+	selection := e.options.TargetScope.For(input)
+	if selection == nil {
+		return e.operators
+	}
+	return slices.DeleteFunc(slices.Clone(e.operators), func(operator *clusteredOperator) bool {
+		return !selection.Allows(operator.templatePath)
+	})
+}
+
+// onCatchAllPage reports whether operator matched only because the host serves
+// this page for any missing path.
+func onCatchAllPage(event *output.InternalWrappedEvent, operator *clusteredOperator, input string) bool {
+	if event.CatchAll == nil || !catchall.Applies(operator.templateInfo, operator.operator) || !event.CatchAll() {
+		return false
+	}
+	gologger.Verbose().Msgf("[%s] Dropped match on %s: the host serves this page for any missing path", operator.templateID, input)
+	return true
+}
+
+// Execute executes the protocol group and returns true or false if results were found.
+func (e *ClusterExecuter) Execute(ctx *scan.ScanContext) (bool, error) {
+	var results bool
+
+	clusterOperators := e.operatorsFor(ctx.Input.MetaInput)
+	if len(clusterOperators) == 0 {
+		return false, nil
+	}
+
+	inputItem := ctx.Input.Clone()
+	if e.options.InputHelper != nil && ctx.Input.MetaInput.Input != "" {
+		if inputItem.MetaInput.Input = e.options.InputHelper.TransformPinned(ctx.Input.MetaInput.Input, ctx.Input.MetaInput.CustomIP, e.templateType); ctx.Input.MetaInput.Input == "" {
+			return false, nil
+		}
+	}
+	previous := make(map[string]interface{})
+	dynamicValues := make(map[string]interface{})
+
+	// Track if callback was invoked
+	callbackCalled := &atomic.Bool{}
+
+	err := e.requests.ExecuteWithResults(inputItem, dynamicValues, previous, func(event *output.InternalWrappedEvent) {
+		callbackCalled.Store(true)
+		if event == nil {
+			return
+		}
+		if event.InternalEvent == nil {
+			event.InternalEvent = make(map[string]interface{})
+		}
+		for _, operator := range clusterOperators {
+			clonedEvent := event.CloneShallow()
+
+			result, matched := operator.operator.Execute(clonedEvent.InternalEvent, e.requests.Match, e.requests.Extract, e.options.Options.Debug || e.options.Options.DebugResponse)
+			clonedEvent.InternalEvent["template-id"] = operator.templateID
+			clonedEvent.InternalEvent["template-path"] = operator.templatePath
+			clonedEvent.InternalEvent["template-info"] = operator.templateInfo
+
+			if matched && result != nil && onCatchAllPage(event, operator, ctx.Input.MetaInput.Input) {
+				continue
+			}
+			if matched && result != nil {
+				clonedEvent.OperatorsResult = result
+				clonedEvent.Results = e.requests.MakeResultEvent(clonedEvent)
+				results = true
+
+				_ = writer.WriteResult(clonedEvent, e.options.Output, e.options.Progress, e.options.IssuesClient)
+			} else if !matched && e.options.Options.MatcherStatus {
+				if err := e.options.Output.WriteFailure(clonedEvent); err != nil {
+					gologger.Warning().Msgf("Could not write failure event to output: %s\n", err)
+				}
+			}
+		}
+	})
+
+	// Fallback: if callback was never called and matcher-status is enabled,
+	// write failure events for each operator in the cluster
+	if !callbackCalled.Load() && e.options.Options.MatcherStatus {
+		// Parse URL fields from the input
+		fields := protocolUtils.GetJsonFieldsFromURL(ctx.Input.MetaInput.Input)
+		for _, operator := range clusterOperators {
+			errMsg := ""
+			if err != nil {
+				errMsg = err.Error()
+			}
+			fakeEvent := &output.InternalWrappedEvent{
+				Results: []*output.ResultEvent{
+					{
+						TemplateID:   operator.templateID,
+						TemplatePath: operator.templatePath,
+						Info:         operator.templateInfo,
+						Type:         e.templateType.String(),
+						Host:         fields.Host,
+						Port:         fields.Port,
+						Scheme:       fields.Scheme,
+						URL:          fields.URL,
+						Path:         fields.Path,
+						Timestamp:    time.Now(),
+						Error:        errMsg,
+					},
+				},
+				OperatorsResult: &operators.Result{
+					Matched: false,
+				},
+			}
+			if err := e.options.Output.WriteFailure(fakeEvent); err != nil {
+				gologger.Warning().Msgf("Could not write failure event to output: %s\n", err)
+			}
+		}
+	}
+
+	// A skip is reported like the engine's own skip of a target: in the
+	// failure event, without a warning.
+	if errors.Is(err, hosterrorscache.ErrUnresponsiveHost) {
+		err = nil
+	}
+	return results, err
+}
+
+// ExecuteWithResults executes the protocol requests and returns results instead of writing them.
+func (e *ClusterExecuter) ExecuteWithResults(ctx *scan.ScanContext) ([]*output.ResultEvent, error) {
+	clusterOperators := e.operatorsFor(ctx.Input.MetaInput)
+	if len(clusterOperators) == 0 {
+		return nil, nil
+	}
+	dynamicValues := make(map[string]interface{})
+
+	inputItem := ctx.Input.Clone()
+	if e.options.InputHelper != nil && ctx.Input.MetaInput.Input != "" {
+		if inputItem.MetaInput.Input = e.options.InputHelper.TransformPinned(ctx.Input.MetaInput.Input, ctx.Input.MetaInput.CustomIP, e.templateType); ctx.Input.MetaInput.Input == "" {
+			return nil, nil
+		}
+	}
+	// Events are logged on the caller's context so its OnResult callback fires,
+	// exactly as a single template's executer does. A workflow step drives its
+	// subtemplates through that callback, so logging to a private context would
+	// silently drop every subtemplate of a clustered step.
+	err := e.requests.ExecuteWithResults(inputItem, dynamicValues, nil, func(event *output.InternalWrappedEvent) {
+		for _, operator := range clusterOperators {
+			clonedEvent := event.CloneShallow()
+
+			result, matched := operator.operator.Execute(clonedEvent.InternalEvent, e.requests.Match, e.requests.Extract, e.options.Options.Debug || e.options.Options.DebugResponse)
+			if matched && result != nil && onCatchAllPage(event, operator, ctx.Input.MetaInput.Input) {
+				continue
+			}
+			if matched && result != nil {
+				clonedEvent.OperatorsResult = result
+				clonedEvent.InternalEvent["template-id"] = operator.templateID
+				clonedEvent.InternalEvent["template-path"] = operator.templatePath
+				clonedEvent.InternalEvent["template-info"] = operator.templateInfo
+				clonedEvent.Results = e.requests.MakeResultEvent(clonedEvent)
+				ctx.LogEvent(clonedEvent)
+			}
+		}
+	})
+	if err != nil {
+		ctx.LogError(err)
+	}
+
+	// The skip is logged on ctx above, so the caller does not warn about it as
+	// it would about a failed request.
+	if errors.Is(err, hosterrorscache.ErrUnresponsiveHost) {
+		err = nil
+	}
+	return ctx.GenerateResult(), err
+}

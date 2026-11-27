@@ -1,0 +1,173 @@
+package markdown
+
+import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"unicode/utf8"
+
+	"github.com/google/uuid"
+	"github.com/projectdiscovery/gologger"
+
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/reporting/exporters/markdown/util"
+	"github.com/projectdiscovery/nuclei/v3/pkg/reporting/format"
+	fileutil "github.com/projectdiscovery/utils/file"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+)
+
+const indexFileName = "index.md"
+const extension = ".md"
+const maxFilenameLength = 255
+
+type Exporter struct {
+	directory string
+	options   *Options
+}
+
+// Options contains the configuration options for GitHub issue tracker client
+type Options struct {
+	// Directory is the directory to export found results to
+	Directory string `yaml:"directory"`
+	OmitRaw   bool   `yaml:"omit-raw"`
+	SortMode  string `yaml:"sort-mode"`
+}
+
+// New creates a new markdown exporter integration client based on options.
+func New(options *Options) (*Exporter, error) {
+	directory := options.Directory
+	if options.Directory == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		directory = dir
+	}
+	_ = os.MkdirAll(directory, 0755)
+
+	// index generation header
+	dataHeader := util.CreateTableHeader("Hostname/IP", "Finding", "Severity")
+
+	err := os.WriteFile(filepath.Join(directory, indexFileName), []byte(dataHeader), 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Exporter{options: options, directory: directory}, nil
+}
+
+// Export exports a passed result event to markdown
+func (exporter *Exporter) Export(event *output.ResultEvent) error {
+	// index file generation
+	file, err := os.OpenFile(filepath.Join(exporter.directory, indexFileName), os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	filename := createFileName(event)
+
+	// If the sort mode is set to severity, host, or template, then we need to get a safe version of the name for a
+	// subdirectory to store the file in.
+	// This will allow us to sort the files into subdirectories based on the sort mode. The subdirectory will need to
+	// be created if it does not exist.
+	fileUrl := filename
+	subdirectory := ""
+	switch exporter.options.SortMode {
+	case "severity":
+		subdirectory = event.Info.SeverityHolder.Severity.String()
+	case "host":
+		subdirectory = event.Host
+	case "template":
+		subdirectory = event.TemplateID
+	}
+	if subdirectory != "" {
+		// Sanitize the subdirectory name to remove any characters that are not allowed in a directory name
+		subdirectory = sanitizeFilename(subdirectory)
+
+		// Prepend the subdirectory name to the filename for the fileUrl
+		fileUrl = filepath.Join(subdirectory, filename)
+
+		// Create the subdirectory if it does not exist
+		if err = fileutil.CreateFolders(filepath.Join(exporter.directory, subdirectory)); err != nil {
+			gologger.Warning().Msgf("Could not create subdirectory for markdown report: %s", err)
+		}
+	}
+
+	host := util.CreateLink(event.Host, fileUrl)
+	finding := event.TemplateID + " " + event.MatcherName
+	severity := event.Info.SeverityHolder.Severity.String()
+
+	dataBuilder := &bytes.Buffer{}
+	dataBuilder.WriteString(util.CreateHeading3(format.Summary(event)))
+	dataBuilder.WriteString("\n")
+	dataBuilder.WriteString(util.CreateHorizontalLine())
+	dataBuilder.WriteString(format.CreateReportDescription(event, util.MarkdownFormatter{}, exporter.options.OmitRaw))
+	data := dataBuilder.Bytes()
+
+	if err := os.WriteFile(filepath.Join(exporter.directory, subdirectory, filename), data, 0644); err != nil {
+		return err
+	}
+
+	_, err = file.WriteString(util.CreateTableRow(host, finding, severity))
+	return err
+}
+
+func createFileName(event *output.ResultEvent) string {
+	operatorName := ""
+	if event.MatcherName != "" {
+		operatorName = event.MatcherName
+	} else if event.ExtractorName != "" {
+		operatorName = event.ExtractorName
+	}
+
+	// Keep the UUID and extension outside the truncated prefix. Cutting the
+	// assembled name drops them when the template id or host is long, so
+	// different findings overwrite one report.
+	uniqueSuffix := "-" + uuid.NewString()
+	if operatorName != "" {
+		operatorBudget := maxFilenameLength - len(uniqueSuffix) - len(extension) - 1
+		uniqueSuffix += "-" + truncateFilename(sanitizeFilenamePart(operatorName), operatorBudget)
+	}
+	uniqueSuffix += extension
+
+	prefix := sanitizeFilenamePart(event.TemplateID + "-" + event.Host)
+	prefix = truncateFilename(prefix, maxFilenameLength-len(uniqueSuffix))
+	return prefix + uniqueSuffix
+}
+
+// Close closes the exporter after operation
+func (exporter *Exporter) Close() error {
+	return nil
+}
+
+func sanitizeFilename(filename string) string {
+	return truncateFilename(sanitizeFilenamePart(filename), maxFilenameLength)
+}
+
+func sanitizeFilenamePart(filename string) string {
+	// Note: "\\" must be replaced together with "/" so an attacker-controlled
+	// host or template id with Windows-style path separators cannot traverse
+	// out of the configured directory when this value is later used as a
+	// subdirectory or filename. ".." is replaced for the same reason — even
+	// without a separator, a name of "..foo" is harmless but a name of ".."
+	// alone (or any sequence containing "..") is treated by filepath.Clean as
+	// a parent reference once joined with the report directory.
+	return stringsutil.ReplaceAll(filename, "_", "?", "/", "\\", "..", ">", "|", ":", ";", "*", "<", "\"", "'", " ")
+}
+
+func truncateFilename(filename string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(filename) <= maxBytes {
+		return filename
+	}
+	filename = filename[:maxBytes]
+	for len(filename) > 0 && !utf8.ValidString(filename) {
+		filename = filename[:len(filename)-1]
+	}
+	return filename
+}

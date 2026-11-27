@@ -1,0 +1,693 @@
+mod utils;
+use assert_cmd::cargo_bin;
+use assert_cmd::prelude::*;
+use httpmock::Method::GET;
+use httpmock::{MockServer, Regex};
+use predicates::prelude::*;
+use std::fs::{read_dir, read_to_string};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
+use utils::{setup_tmp_directory, teardown_tmp_directory};
+
+/// Upper bound on how long a single feroxbuster invocation may run before the test
+/// kills it. Healthy runs of the tests below finish in a few seconds.
+const RUN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Spawn `cmd`, wait for it to finish, and fail the test if it is still running
+/// after [`RUN_TIMEOUT`].
+///
+/// The guard exists because the #1324 failure mode is a hang rather than a clean
+/// non-zero exit: the panic unwinds `main` while the tokio runtime still holds the
+/// terminal-input task blocked in `crossterm::event::poll`, so `Runtime::drop` never
+/// returns and the process sits there until an external kill (observed as exit 124
+/// under `timeout(1)` on a dev build; release builds abort with 134 because
+/// `[profile.release] panic = 'abort'`). A plain `.assert()` would block the test
+/// suite forever instead of reporting the regression.
+fn run_to_completion(cmd: &mut Command, shape: &str) -> ExitStatus {
+    let mut child = cmd
+        .spawn()
+        .unwrap_or_else(|e| panic!("could not spawn feroxbuster for {shape}: {e}"));
+
+    let deadline = Instant::now() + RUN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "feroxbuster ({shape}) was still running after {RUN_TIMEOUT:?}: \
+                     the run hung instead of completing"
+                );
+            }
+            Err(e) => panic!("could not wait for feroxbuster ({shape}): {e}"),
+        }
+    }
+}
+
+/// Assert that `dir` contains exactly one `<name>.logs` directory and return it
+/// together with the `ferox-*.log` files inside it — one per child that wrote its
+/// scan results there.
+fn child_log_dir(dir: &Path) -> Result<(PathBuf, Vec<PathBuf>), Box<dyn std::error::Error>> {
+    let mut log_dirs = Vec::new();
+    for entry in read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name().to_string_lossy().ends_with(".logs") {
+            log_dirs.push(entry.path());
+        }
+    }
+    assert_eq!(
+        log_dirs.len(),
+        1,
+        "expected exactly one .logs directory under {}",
+        dir.display()
+    );
+    let log_dir = log_dirs.pop().unwrap();
+
+    let mut logs = Vec::new();
+    for entry in read_dir(&log_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("ferox-") && name.ends_with(".log") {
+            logs.push(entry.path());
+        }
+    }
+    Ok((log_dir, logs))
+}
+
+#[test]
+/// send the function a file to which we dont have permission in order to execute error branch
+fn main_use_root_owned_file_as_wordlist() {
+    let srv = MockServer::start();
+
+    let mock = srv.mock(|when, then| {
+        when.method(GET).path("/");
+        then.status(200).body("this is a test");
+    });
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .arg("--url")
+        .arg(srv.url("/"))
+        .arg("--wordlist")
+        .arg("/etc/shadow")
+        .arg("-vvvv")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Could not open /etc/shadow"));
+
+    assert_eq!(mock.hits(), 0);
+}
+
+#[test]
+/// send the function an empty file
+fn main_use_empty_wordlist() -> Result<(), Box<dyn std::error::Error>> {
+    let srv = MockServer::start();
+    let (tmp_dir, file) = setup_tmp_directory(&[], "wordlist")?;
+
+    let mock = srv.mock(|when, then| {
+        when.method(GET).path("/");
+        then.status(200).body("this is a test");
+    });
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .arg("--url")
+        .arg(srv.url("/"))
+        .arg("--wordlist")
+        .arg(file.as_os_str())
+        .arg("-vvvv")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Did not find any words in"));
+
+    assert_eq!(mock.hits(), 0);
+
+    teardown_tmp_directory(tmp_dir);
+    Ok(())
+}
+
+#[test]
+/// send nothing over stdin, expect heuristics to be upset during connectivity test
+fn main_use_empty_stdin_targets() -> Result<(), Box<dyn std::error::Error>> {
+    let (tmp_dir, file) = setup_tmp_directory(&[], "wordlist")?;
+
+    // get_targets is called before scan, so the empty wordlist shouldn't trigger
+    // the 'Did not find any words' error
+    Command::new(cargo_bin!("feroxbuster"))
+        .arg("--stdin")
+        .arg("--wordlist")
+        .arg(file.as_os_str())
+        .arg("-vvv")
+        .stdin(std::fs::File::open(file)?)
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Could not connect to any target provided")
+                .and(predicate::str::contains("Target Url"))
+                .not(), // no target url found
+        );
+
+    teardown_tmp_directory(tmp_dir);
+
+    Ok(())
+}
+
+#[test]
+/// send three targets over stdin, expect parallel to spawn children and each child config to show
+/// up in the output file
+fn main_parallel_spawns_children() -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+    let t3 = MockServer::start();
+
+    let words = [
+        String::from("LICENSE"),
+        String::from("stuff"),
+        String::from("things"),
+        String::from("mostuff"),
+        String::from("mothings"),
+    ];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (output_dir, outfile) = setup_tmp_directory(&[], "output-file")?;
+    let (tgt_tmp_dir, targets) =
+        setup_tmp_directory(&[t1.url("/"), t2.url("/"), t3.url("/")], "targets")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .env("RUST_LOG", "trace")
+        .arg("--stdin")
+        .arg("--parallel")
+        .arg("2")
+        .arg("--quiet")
+        .arg("--debug-log")
+        .arg(outfile.as_os_str())
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .stdin(std::fs::File::open(targets)?)
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Could not connect to any target provided")
+                .and(predicate::str::contains("Target Url"))
+                .not(), // no target url found
+        );
+
+    let contents = read_to_string(outfile).unwrap();
+    println!("contents: {contents}");
+
+    assert!(contents.contains("parallel branch && wrapped main")); // exits parallel branch
+
+    // DBG      0.007 feroxbuster parallel exec: target/debug/feroxbuster
+    //   --debug-log /tmp/.tmpAjRts6/output-file --wordlist /tmp/.tmpS4CKKq/wordlist
+    //   --silent -u http://127.0.0.1:41979/
+    let r1 = Regex::new(&format!("parallel exec:.*-u {}", t1.url("/"))).unwrap();
+    let r2 = Regex::new(&format!("parallel exec:.*-u {}", t2.url("/"))).unwrap();
+    let r3 = Regex::new(&format!("parallel exec:.*-u {}", t3.url("/"))).unwrap();
+
+    assert!(r1.is_match(&contents)); // all 3 were spawned
+    assert!(r2.is_match(&contents));
+    assert!(r3.is_match(&contents));
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(output_dir);
+
+    Ok(())
+}
+
+#[test]
+/// send three targets over stdin with --output enabled, expect parallel to create a new directory
+/// and the log files therein
+fn main_parallel_creates_output_directory() -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+    let t3 = MockServer::start();
+
+    let words = [
+        String::from("LICENSE"),
+        String::from("stuff"),
+        String::from("things"),
+        String::from("mostuff"),
+        String::from("mothings"),
+    ];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (output_dir, outfile) = setup_tmp_directory(&[], "output-file")?;
+    let (tgt_tmp_dir, targets) =
+        setup_tmp_directory(&[t1.url("/"), t2.url("/"), t3.url("/")], "targets")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .arg("--stdin")
+        .arg("--quiet")
+        .arg("--parallel")
+        .arg("2")
+        .arg("--output")
+        .arg(outfile.as_os_str())
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .stdin(std::fs::File::open(targets)?)
+        .assert()
+        .success()
+        .stderr(
+            predicate::str::contains("Could not connect to any target provided")
+                .and(predicate::str::contains("Target Url"))
+                .not(), // no target url found
+        );
+
+    // output_dir should return something similar to output-file-1627845244.logs with the
+    // line below. if it ever fails, can use the regex below to filter out the right directory
+    let entries: Vec<_> = read_dir(&output_dir)?.collect::<Result<Vec<_>, _>>()?;
+
+    let mut num_logs = 0;
+    let file_regex = Regex::new("ferox-[a-zA-Z_:0-9]+-[0-9]+.log").unwrap();
+    let dir_regex = Regex::new("output-file.*\\.logs").unwrap();
+
+    // Find the subdirectory that matches the expected pattern
+    let sub_dir = entries
+        .iter()
+        .find(|entry| {
+            let file_type = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            if !file_type {
+                return false;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            dir_regex.is_match(&name_str)
+        })
+        .map(|entry| output_dir.as_ref().join(entry.file_name()));
+
+    let sub_dir = match sub_dir {
+        Some(dir) => dir,
+        None => {
+            // If no matching directory found, check if files are directly in output_dir
+            println!("No subdirectory found matching pattern, checking output_dir contents:");
+            for entry in &entries {
+                println!("  {:?}", entry.file_name().to_string_lossy());
+            }
+            // Fallback to the first directory entry or the output_dir itself
+            if let Some(first_dir) = entries
+                .iter()
+                .find(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            {
+                output_dir.as_ref().join(first_dir.file_name())
+            } else {
+                output_dir.as_ref().to_path_buf()
+            }
+        }
+    };
+
+    // created directory like output-file-1627845741.logs/
+    println!("sub_dir: {:?}", sub_dir.to_string_lossy());
+
+    for entry in sub_dir.read_dir()? {
+        let entry = entry?;
+        // created each file like ferox-https_localhost-1627845741.log
+        println!("name: {:?}", entry.file_name().to_string_lossy());
+        assert!(file_regex.is_match(&entry.file_name().to_string_lossy()));
+        num_logs += 1;
+    }
+
+    // should be 3 log files total
+    assert_eq!(num_logs, 3);
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(output_dir);
+
+    Ok(())
+}
+
+#[test]
+/// download a wordlist from a url
+fn main_download_wordlist_from_url() -> Result<(), Box<dyn std::error::Error>> {
+    let srv = MockServer::start();
+
+    let (tmp_dir, _) = setup_tmp_directory(&["a".to_string()], "wordlist")?;
+
+    let mock1 = srv.mock(|when, then| {
+        when.method(GET).path("/derp");
+        then.status(200).body("stuff\nthings");
+    });
+
+    // serve endpoints stuff and things
+    let mock2 = srv.mock(|when, then| {
+        when.method(GET).path("/stuff");
+        then.status(200);
+    });
+
+    let mock3 = srv.mock(|when, then| {
+        when.method(GET).path("/things");
+        then.status(200);
+    });
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .current_dir(&tmp_dir)
+        .arg("--url")
+        .arg(srv.url("/"))
+        .arg("--wordlist")
+        .arg(srv.url("/derp"))
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(srv.url("/derp")));
+
+    teardown_tmp_directory(tmp_dir);
+
+    assert_eq!(mock1.hits(), 1); // downloaded wordlist
+    assert_eq!(mock2.hits(), 1); // found stuff from wordlist
+    assert_eq!(mock3.hits(), 1); // found things from wordlist
+
+    Ok(())
+}
+
+#[test]
+/// set parallel in a config file instead of passing --parallel, expect the children to be spawned
+/// just the same instead of a panic on the missing command line argument
+fn main_parallel_from_config_file_spawns_children() -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+
+    let words = [String::from("LICENSE"), String::from("stuff")];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (output_dir, outfile) = setup_tmp_directory(&[], "output-file")?;
+    let (tgt_tmp_dir, targets) = setup_tmp_directory(&[t1.url("/"), t2.url("/")], "targets")?;
+
+    // parallel comes from the config file in the working directory, --parallel is never passed
+    let (cfg_tmp_dir, _cfg) =
+        setup_tmp_directory(&[String::from("parallel = 2")], "ferox-config.toml")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .current_dir(cfg_tmp_dir.path())
+        .env("RUST_LOG", "trace")
+        .arg("--stdin")
+        .arg("--quiet")
+        .arg("--debug-log")
+        .arg(outfile.as_os_str())
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .arg("--time-limit")
+        .arg("100m")
+        .stdin(std::fs::File::open(targets)?)
+        .assert()
+        .success();
+
+    let contents = read_to_string(outfile).unwrap();
+
+    assert!(contents.contains("parallel branch && wrapped main")); // exits parallel branch
+
+    let r1 = Regex::new(&format!("parallel exec:.*-u {}", t1.url("/"))).unwrap();
+    let r2 = Regex::new(&format!("parallel exec:.*-u {}", t2.url("/"))).unwrap();
+
+    assert!(r1.is_match(&contents)); // both were spawned
+    assert!(r2.is_match(&contents));
+
+    // the original process leaves the time limit to the children, so this line can only come
+    // from a child, and only if its `parallel` was set to 0
+    assert!(contents.contains("max time limit as string"));
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(output_dir);
+    teardown_tmp_directory(cfg_tmp_dir);
+
+    Ok(())
+}
+
+#[test]
+/// pass --parallel=2 instead of --parallel 2, expect the argument to come off the children's
+/// command line all the same; clap turns a child away for using --parallel alongside its -u
+fn main_parallel_equals_form_is_stripped_from_children() -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+
+    let words = [String::from("LICENSE"), String::from("stuff")];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (output_dir, outfile) = setup_tmp_directory(&[], "output-file")?;
+    let (tgt_tmp_dir, targets) = setup_tmp_directory(&[t1.url("/"), t2.url("/")], "targets")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .env("RUST_LOG", "trace")
+        .arg("--stdin")
+        .arg("--parallel=2")
+        .arg("--quiet")
+        .arg("--debug-log")
+        .arg(outfile.as_os_str())
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .stdin(std::fs::File::open(targets)?)
+        .assert()
+        .success();
+
+    let contents = read_to_string(outfile).unwrap();
+
+    for target in [t1.url("/"), t2.url("/")] {
+        let spawned = Regex::new(&format!("parallel exec:.*-u {target}"))
+            .unwrap()
+            .find(&contents)
+            .map(|found| found.as_str().to_string())
+            .unwrap_or_else(|| panic!("no child spawned for {target}"));
+
+        assert!(!spawned.contains("--parallel"));
+    }
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(output_dir);
+
+    Ok(())
+}
+
+#[test]
+/// clap enforces that --parallel needs --stdin, but only for the command line; expect the same
+/// check when the value came from a config file
+fn main_parallel_from_config_file_requires_stdin() -> Result<(), Box<dyn std::error::Error>> {
+    let words = [String::from("LICENSE")];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (cfg_tmp_dir, _cfg) =
+        setup_tmp_directory(&[String::from("parallel = 2")], "ferox-config.toml")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .current_dir(cfg_tmp_dir.path())
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--parallel requires --stdin"));
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(cfg_tmp_dir);
+
+    Ok(())
+}
+
+#[test]
+/// same for the conflict with --url; stdin from a config file gets a url past clap, and the
+/// parallel branch has nowhere to send the targets
+fn main_parallel_from_config_file_conflicts_with_url() -> Result<(), Box<dyn std::error::Error>> {
+    let words = [String::from("LICENSE")];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let settings = String::from("parallel = 2\nstdin = true");
+    let (cfg_tmp_dir, _cfg) = setup_tmp_directory(&[settings], "ferox-config.toml")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .current_dir(cfg_tmp_dir.path())
+        .arg("--url")
+        .arg("http://localhost")
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--parallel cannot be used with --url",
+        ));
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(cfg_tmp_dir);
+
+    Ok(())
+}
+
+#[test]
+/// #1325: the --parallel branch stripped --stdin from children with a regex
+/// is_match, so any argv element containing that substring was dropped. A header
+/// value of `--stdin` then left `-H` without its value, clap refused to start the
+/// child, and the parent ignored the child's exit code so the run still exited 0.
+/// Compare the whole argument so only the flag itself is removed.
+fn main_parallel_stdin_filter_keeps_args_with_stdin_substring(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+
+    let words = [
+        String::from("LICENSE"),
+        String::from("stuff"),
+        String::from("things"),
+    ];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (output_dir, outfile) = setup_tmp_directory(&[], "output-file")?;
+    let (tgt_tmp_dir, targets) = setup_tmp_directory(&[t1.url("/"), t2.url("/")], "targets")?;
+
+    Command::new(cargo_bin!("feroxbuster"))
+        .env("RUST_LOG", "trace")
+        .arg("--stdin")
+        .arg("--parallel")
+        .arg("2")
+        .arg("--quiet")
+        .arg("--no-state")
+        .arg("-H")
+        .arg("X-Foo: --stdin")
+        .arg("--debug-log")
+        .arg(outfile.as_os_str())
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .stdin(std::fs::File::open(targets)?)
+        .assert()
+        .success()
+        // with the bug, clap prints this from the child after -H loses its value
+        .stderr(predicate::str::contains("a value is required for '--headers'").not());
+
+    let contents = read_to_string(outfile).unwrap();
+    println!("contents: {contents}");
+
+    assert!(contents.contains("parallel branch && wrapped main"));
+
+    for target in [t1.url("/"), t2.url("/")] {
+        let spawned = Regex::new(&format!("parallel exec:.*-u {target}"))
+            .unwrap()
+            .find(&contents)
+            .map(|found| found.as_str().to_string())
+            .unwrap_or_else(|| panic!("no child spawned for {target}"));
+
+        // the header value must survive into the child's argv (proves the filter
+        // no longer drops arguments that merely contain the --stdin substring)
+        assert!(
+            spawned.contains("X-Foo: --stdin"),
+            "child argv lost the header value containing --stdin: {spawned}"
+        );
+    }
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(output_dir);
+
+    Ok(())
+}
+
+/// #1324: the `--parallel` branch located the output value by searching argv for a
+/// standalone `-o`/`--output` element and `unwrap()`ed the result, so every other
+/// clap-accepted spelling of the flag aborted the run — `--output=FILE`, the glued
+/// `-oFILE`, the `-o=FILE` and bundled `-qo FILE` / `-qoFILE` variants. The value is
+/// parsed into `config.output` the same way regardless of spelling, so each child must
+/// still end up with its own `ferox-*.log` in the shared `.logs` directory.
+#[test]
+fn main_parallel_output_every_cli_shape_writes_child_logs() -> Result<(), Box<dyn std::error::Error>>
+{
+    for shape in ["--output=FILE", "-oFILE", "-o=FILE", "-qo FILE", "-qoFILE"] {
+        let t1 = MockServer::start();
+        let t2 = MockServer::start();
+
+        let words = [String::from("LICENSE"), String::from("stuff")];
+        let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+        let (tgt_tmp_dir, targets) = setup_tmp_directory(&[t1.url("/"), t2.url("/")], "targets")?;
+        let (run_tmp_dir, _) = setup_tmp_directory(&[], "output-file")?;
+
+        // every spelling below resolves to the same value once clap has parsed it;
+        // only the positional search for a standalone `-o` element ever differed
+        let outfile = run_tmp_dir.path().join("output-file");
+        let mut args: Vec<String> = match shape {
+            "--output=FILE" => vec![format!("--output={}", outfile.display())],
+            "-oFILE" => vec![format!("-o{}", outfile.display())],
+            "-o=FILE" => vec![format!("-o={}", outfile.display())],
+            "-qo FILE" => vec!["-qo".to_string(), outfile.display().to_string()],
+            "-qoFILE" => vec![format!("-qo{}", outfile.display())],
+            other => unreachable!("unhandled output shape {other}"),
+        };
+        // the bundled `-qo` spellings already carry --quiet
+        if !shape.starts_with("-qo") {
+            args.push("--quiet".to_string());
+        }
+
+        let mut cmd = Command::new(cargo_bin!("feroxbuster"));
+        cmd.arg("--stdin")
+            .arg("--parallel")
+            .arg("2")
+            .args(&args)
+            .arg("--wordlist")
+            .arg(wordlist.as_os_str())
+            .current_dir(run_tmp_dir.path())
+            .stdin(std::fs::File::open(&targets)?);
+
+        let status = run_to_completion(&mut cmd, shape);
+        assert!(
+            status.success(),
+            "feroxbuster failed for shape {shape}: {status}"
+        );
+
+        let (log_dir, logs) = child_log_dir(run_tmp_dir.path())?;
+        assert_eq!(
+            logs.len(),
+            2,
+            "shape {shape}: expected one ferox-*.log per target in {}, found {:?}",
+            log_dir.display(),
+            logs,
+        );
+
+        teardown_tmp_directory(word_tmp_dir);
+        teardown_tmp_directory(tgt_tmp_dir);
+        teardown_tmp_directory(run_tmp_dir);
+    }
+
+    Ok(())
+}
+
+#[test]
+/// #1324, config-file flavor: `output` sourced from a config file puts no `-o`
+/// element on the command line at all, so the argv search panicked on the first
+/// target before any child was spawned. The children read the same config file, so
+/// their per-target output path has to come from the parent's decision rather than
+/// from their own argv.
+fn main_parallel_config_file_output_writes_child_logs() -> Result<(), Box<dyn std::error::Error>> {
+    let t1 = MockServer::start();
+    let t2 = MockServer::start();
+
+    let words = [String::from("LICENSE"), String::from("stuff")];
+    let (word_tmp_dir, wordlist) = setup_tmp_directory(&words, "wordlist")?;
+    let (tgt_tmp_dir, targets) = setup_tmp_directory(&[t1.url("/"), t2.url("/")], "targets")?;
+    let (cfg_tmp_dir, _) = setup_tmp_directory(
+        &[String::from("output = \"cfg-output.txt\"")],
+        "ferox-config.toml",
+    )?;
+
+    let mut cmd = Command::new(cargo_bin!("feroxbuster"));
+    cmd.current_dir(cfg_tmp_dir.path())
+        .arg("--stdin")
+        .arg("--quiet")
+        .arg("--parallel")
+        .arg("2")
+        .arg("--wordlist")
+        .arg(wordlist.as_os_str())
+        .stdin(std::fs::File::open(targets)?);
+
+    let status = run_to_completion(&mut cmd, "config-file output");
+    assert!(
+        status.success(),
+        "feroxbuster failed with a config-file output: {status}"
+    );
+
+    let (log_dir, logs) = child_log_dir(cfg_tmp_dir.path())?;
+    assert_eq!(
+        logs.len(),
+        2,
+        "config-file output: expected one ferox-*.log per target in {}, found {:?}",
+        log_dir.display(),
+        logs,
+    );
+
+    teardown_tmp_directory(word_tmp_dir);
+    teardown_tmp_directory(tgt_tmp_dir);
+    teardown_tmp_directory(cfg_tmp_dir);
+
+    Ok(())
+}

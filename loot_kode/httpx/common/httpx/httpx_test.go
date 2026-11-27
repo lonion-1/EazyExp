@@ -1,0 +1,550 @@
+package httpx
+
+import (
+	"context"
+	"crypto/tls"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/projectdiscovery/fastdialer/fastdialer"
+	"github.com/projectdiscovery/retryablehttp-go"
+	"github.com/stretchr/testify/require"
+	ztls "github.com/zmap/zcrypto/tls"
+)
+
+func TestDo(t *testing.T) {
+	ht, err := New(&DefaultOptions)
+	require.Nil(t, err)
+
+	t.Run("content-length in header", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://scanme.sh", nil)
+		require.Nil(t, err)
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.Nil(t, err)
+		require.Equal(t, 2, resp.ContentLength)
+	})
+
+	t.Run("content-length with binary body", func(t *testing.T) {
+		body := []byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x00, 0x01, 0x00, 0x01, 0x80, 0x00, 0x00, 0xff}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "image/gif")
+			_, _ = w.Write(body)
+		}))
+		defer srv.Close()
+
+		req, err := retryablehttp.NewRequest(http.MethodGet, srv.URL, nil)
+		require.Nil(t, err)
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.Nil(t, err)
+		require.Equal(t, len(body), resp.ContentLength)
+		require.Equal(t, body, resp.RawData)
+	})
+}
+
+func TestSetCustomHeaders(t *testing.T) {
+	h := &HTTPX{Options: &Options{}}
+
+	t.Run("duplicate values preserved in order", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"X-Test": {"one", "two"}})
+		require.Equal(t, []string{"one", "two"}, req.Header.Values("X-Test"))
+	})
+
+	t.Run("case-variant duplicates are coalesced", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"X-Test": {"one"}, "x-test": {"two"}})
+		require.ElementsMatch(t, []string{"one", "two"}, req.Header.Values("X-Test"))
+	})
+
+	t.Run("custom header replaces existing value", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		req.Header.Set("User-Agent", "default-agent")
+		h.SetCustomHeaders(req, map[string][]string{"User-Agent": {"custom-agent"}})
+		require.Equal(t, []string{"custom-agent"}, req.Header.Values("User-Agent"))
+	})
+
+	t.Run("host header sets request host", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"Host": {"custom.host"}})
+		require.Equal(t, "custom.host", req.Host)
+		require.Empty(t, req.Header.Values("Host"))
+	})
+
+	t.Run("multiple distinct headers preserved", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"X-One": {"1"}, "X-Two": {"2"}})
+		require.Equal(t, []string{"1"}, req.Header.Values("X-One"))
+		require.Equal(t, []string{"2"}, req.Header.Values("X-Two"))
+	})
+
+	t.Run("multiple cookie values preserved", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"Cookie": {"a=1", "b=2"}})
+		require.Equal(t, []string{"a=1", "b=2"}, req.Header.Values("Cookie"))
+	})
+
+	t.Run("empty value applied as-is", func(t *testing.T) {
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		h.SetCustomHeaders(req, map[string][]string{"X-Empty": {""}})
+		require.Equal(t, []string{""}, req.Header.Values("X-Empty"))
+	})
+
+	t.Run("unsafe raw header line stored verbatim as key", func(t *testing.T) {
+		hu := &HTTPX{Options: &Options{Unsafe: true}}
+		req, err := retryablehttp.NewRequest(http.MethodGet, "https://example.com", nil)
+		require.NoError(t, err)
+		// in unsafe mode the runner stores the whole raw header line as the key
+		// with an empty value; it must survive canonicalization untouched
+		hu.SetCustomHeaders(req, map[string][]string{"X-Test: one": {""}})
+		require.Equal(t, []string{""}, req.Header.Values("X-Test: one"))
+	})
+}
+
+func TestParseCustomCookies(t *testing.T) {
+	options := &Options{CustomHeaders: map[string][]string{"Cookie": {"a=1", "b=2"}}}
+	options.parseCustomCookies()
+	require.True(t, options.hasCustomCookies())
+	require.Len(t, options.customCookies, 2)
+}
+
+func TestHTTP11DisablesRetryableHTTP2FallbackClient(t *testing.T) {
+	options := DefaultOptions
+	options.Protocol = HTTP11
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+	require.NotNil(t, ht.client)
+	require.Same(t, ht.client.HTTPClient, ht.client.HTTPClient2)
+}
+
+func TestClient2SpeaksHTTP2Only(t *testing.T) {
+	options := DefaultOptions
+	ht, err := New(&options)
+	require.NoError(t, err)
+	transport, ok := ht.client2.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, transport.Protocols)
+	require.True(t, transport.Protocols.HTTP2())
+	require.True(t, transport.Protocols.UnencryptedHTTP2())
+	require.False(t, transport.Protocols.HTTP1())
+}
+
+func TestDefaultProtocolKeepsRetryableHTTP2FallbackClient(t *testing.T) {
+	options := DefaultOptions
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+	require.NotNil(t, ht.client)
+	require.NotSame(t, ht.client.HTTPClient, ht.client.HTTPClient2)
+}
+
+type blockingReadCloser struct{}
+
+func (*blockingReadCloser) Read([]byte) (int, error) {
+	select {}
+}
+
+func (*blockingReadCloser) Close() error {
+	return nil
+}
+
+type switchingProtocolsRoundTripper struct{}
+
+func (switchingProtocolsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: http.StatusSwitchingProtocols,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body:    &blockingReadCloser{},
+		Request: req,
+	}, nil
+}
+
+func TestDoSwitchingProtocolsDoesNotHang(t *testing.T) {
+	options := DefaultOptions
+	options.CdnCheck = "false"
+	options.Timeout = 2 * time.Second
+	options.RetryMax = 0
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+
+	rt := switchingProtocolsRoundTripper{}
+	ht.client.HTTPClient.Transport = rt
+	ht.client.HTTPClient2.Transport = rt
+
+	req, err := retryablehttp.NewRequest(http.MethodGet, "http://example.com", nil)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = ht.Do(req, UnsafeOptions{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("Do hung on 101 Switching Protocols response")
+	}
+}
+
+func TestProtocolALPNConfiguration(t *testing.T) {
+	for _, tc := range []struct {
+		proto          Proto
+		expectedProtos []string
+	}{
+		{HTTP11, []string{"http/1.1"}},
+		{HTTP2, []string{"h2"}},
+		{UNKNOWN, nil},
+		{HTTP3, nil},
+	} {
+		opts := DefaultOptions
+		opts.Protocol = tc.proto
+		ht, err := New(&opts)
+		require.NoError(t, err)
+		require.NotNil(t, ht)
+		tr, ok := ht.client.HTTPClient.Transport.(*http.Transport)
+		require.True(t, ok)
+		require.NotNil(t, tr.TLSClientConfig)
+		require.Equal(t, tc.expectedProtos, tr.TLSClientConfig.NextProtos)
+		switch tc.proto {
+		case HTTP11:
+			require.NotNil(t, tr.Protocols)
+			require.True(t, tr.Protocols.HTTP1())
+			require.False(t, tr.Protocols.HTTP2())
+		case HTTP2:
+			require.NotNil(t, tr.Protocols)
+			require.True(t, tr.Protocols.HTTP2())
+			require.False(t, tr.Protocols.HTTP1())
+		default:
+			require.Nil(t, tr.Protocols)
+		}
+	}
+}
+
+func TestHTTP11DoesNotClobberGODEBUG(t *testing.T) {
+	prev := os.Getenv("GODEBUG")
+	t.Cleanup(func() { _ = os.Setenv("GODEBUG", prev) })
+
+	options := DefaultOptions
+	options.Protocol = HTTP11
+	_, err := New(&options)
+	require.NoError(t, err)
+	require.Equal(t, prev, os.Getenv("GODEBUG"))
+
+	options2 := DefaultOptions
+	options2.Protocol = HTTP2
+	ht2, err := New(&options2)
+	require.NoError(t, err)
+	tr, ok := ht2.client.HTTPClient.Transport.(*http.Transport)
+	require.True(t, ok)
+	require.NotNil(t, tr.Protocols)
+	require.True(t, tr.Protocols.HTTP2())
+	require.False(t, tr.Protocols.HTTP1())
+}
+
+func TestDialerALPNReachesClientHello(t *testing.T) {
+	addr, getHello := startTLSServer(t)
+
+	// DefaultTLSConfig leaves CipherSuites nil, so the expected suites are the ones crypto/tls sends for it
+	ref, err := tls.Dial("tcp", addr, fastdialer.DefaultTLSConfig.Clone())
+	require.NoError(t, err)
+	_ = ref.Close()
+	defaultCiphers := getHello().CipherSuites
+
+	for _, tc := range []struct {
+		name    string
+		proto   Proto
+		ztls    bool
+		sni     string
+		want    []string
+		ciphers bool
+	}{
+		{name: "default", proto: UNKNOWN, want: []string{"http/1.1"}, ciphers: true},
+		{name: "http11", proto: HTTP11, want: []string{"http/1.1"}, ciphers: true},
+		{name: "http2", proto: HTTP2, want: []string{"h2"}, ciphers: true},
+		{name: "http3 falls back", proto: HTTP3, want: []string{"http/1.1"}, ciphers: true},
+		{name: "ztls", proto: UNKNOWN, ztls: true},
+		{name: "ztls http2", proto: HTTP2, ztls: true, want: []string{"h2"}},
+		{name: "sni", proto: UNKNOWN, sni: "scanme.example", want: []string{"http/1.1"}, ciphers: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := DefaultOptions
+			opts.Protocol = tc.proto
+			opts.ZTLS = tc.ztls
+			opts.SniName = tc.sni
+			ht, err := New(&opts)
+			require.NoError(t, err)
+
+			tr, ok := ht.client.HTTPClient.Transport.(*http.Transport)
+			require.True(t, ok)
+			conn, err := tr.DialTLSContext(context.Background(), "tcp", addr)
+			require.NoError(t, err)
+			require.NotNil(t, conn)
+			if tc.ztls {
+				_, ok := conn.(*ztls.Conn)
+				require.True(t, ok, "ztls dial must stay on the ztls connection")
+			} else {
+				_, ok := conn.(*tls.Conn)
+				require.True(t, ok, "standard dial must stay on crypto/tls")
+			}
+			_ = conn.Close()
+
+			hello := getHello()
+			require.NotNil(t, hello)
+			require.Equal(t, tc.want, hello.SupportedProtos)
+			if tc.sni != "" {
+				require.Equal(t, tc.sni, hello.ServerName)
+			}
+			if tc.ciphers {
+				require.ElementsMatch(t, defaultCiphers, hello.CipherSuites)
+			}
+		})
+	}
+}
+
+func TestClient2DialerAdvertisesHTTP2(t *testing.T) {
+	addr, getHello := startTLSServer(t)
+	opts := DefaultOptions
+	ht, err := New(&opts)
+	require.NoError(t, err)
+
+	tr, ok := ht.client2.Transport.(*http.Transport)
+	require.True(t, ok)
+	conn, err := tr.DialTLSContext(context.Background(), "tcp", addr)
+	require.NoError(t, err)
+	_ = conn.Close()
+
+	hello := getHello()
+	require.NotNil(t, hello)
+	require.Equal(t, []string{"h2"}, hello.SupportedProtos)
+}
+
+func TestNewFastdialerOptions(t *testing.T) {
+	t.Run("system resolver fallback enabled by default", func(t *testing.T) {
+		opts := newFastdialerOptions(&Options{})
+		require.True(t, opts.ResolversFile)
+		require.True(t, opts.EnableFallback)
+	})
+
+	t.Run("custom resolvers disable system resolvers and fallback", func(t *testing.T) {
+		resolvers := []string{"1.1.1.1:53"}
+		opts := newFastdialerOptions(&Options{Resolvers: resolvers})
+		require.False(t, opts.ResolversFile)
+		require.False(t, opts.EnableFallback)
+		require.Equal(t, resolvers, opts.BaseResolvers)
+	})
+}
+
+// A redirect to an unreachable target keeps the last response of the chain
+// instead of failing the whole request.
+func TestDo_FollowRedirectsToUnreachableTarget(t *testing.T) {
+	closed, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	unreachable := "http://" + closed.Addr().String() + "/"
+	require.NoError(t, closed.Close())
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/moved", http.StatusFound)
+			return
+		}
+		w.Header().Set("Location", unreachable)
+		w.WriteHeader(http.StatusMovedPermanently)
+		_, _ = w.Write([]byte("moved"))
+	}))
+	defer ts.Close()
+
+	policies := map[string]func(*Options){
+		"-fr":  func(o *Options) { o.FollowRedirects = true },
+		"-fhr": func(o *Options) { o.FollowHostRedirects = true },
+	}
+	for name, policy := range policies {
+		t.Run(name, func(t *testing.T) {
+			options := DefaultOptions
+			options.CdnCheck = "false"
+			options.Timeout = 5 * time.Second
+			options.RetryMax = 0
+			options.MaxRedirects = 10
+			policy(&options)
+			ht, err := New(&options)
+			require.NoError(t, err)
+
+			req, err := retryablehttp.NewRequest(http.MethodGet, ts.URL+"/start", nil)
+			require.NoError(t, err)
+			resp, err := ht.Do(req, UnsafeOptions{})
+			require.NoError(t, err)
+			require.Equal(t, http.StatusMovedPermanently, resp.StatusCode)
+			require.Equal(t, "moved", string(resp.Data))
+			require.Len(t, resp.Chain, 2)
+		})
+	}
+}
+
+// A canceled request fails even if a redirect response was kept.
+func TestDo_FollowRedirectsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/start" {
+			http.Redirect(w, r, "/next", http.StatusFound)
+			return
+		}
+		cancel()
+		<-r.Context().Done()
+	}))
+	defer ts.Close()
+
+	options := DefaultOptions
+	options.CdnCheck = "false"
+	options.Timeout = 5 * time.Second
+	options.RetryMax = 0
+	options.FollowRedirects = true
+	options.MaxRedirects = 10
+	ht, err := New(&options)
+	require.NoError(t, err)
+
+	req, err := retryablehttp.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/start", nil)
+	require.NoError(t, err)
+	_, err = ht.Do(req, UnsafeOptions{})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+
+type trackingReadCloser struct {
+	closed bool
+}
+
+func (*trackingReadCloser) Read([]byte) (int, error) {
+	select {}
+}
+
+func (t *trackingReadCloser) Close() error {
+	t.closed = true
+	return nil
+}
+
+type trackingSwitchingProtocolsRoundTripper struct {
+	body *trackingReadCloser
+}
+
+func (rt trackingSwitchingProtocolsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: http.StatusSwitchingProtocols,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body:    rt.body,
+		Request: req,
+	}, nil
+}
+
+func TestDoSwitchingProtocolsClosesBody(t *testing.T) {
+	for _, maxBody := range []int64{0, 1024, 2 * 1024 * 1024} {
+		options := DefaultOptions
+		options.CdnCheck = "false"
+		options.Timeout = 2 * time.Second
+		options.RetryMax = 0
+		options.MaxResponseBodySizeToRead = maxBody
+
+		ht, err := New(&options)
+		require.NoError(t, err)
+
+		body := &trackingReadCloser{}
+		rt := trackingSwitchingProtocolsRoundTripper{body: body}
+		ht.client.HTTPClient.Transport = rt
+		ht.client.HTTPClient2.Transport = rt
+
+		req, err := retryablehttp.NewRequest(http.MethodGet, "http://example.com", nil)
+		require.NoError(t, err)
+
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+		require.True(t, body.closed, "101 Switching Protocols body was not closed when MaxResponseBodySizeToRead=%d", maxBody)
+	}
+}
+
+func TestDoExtractCSP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Security-Policy", "default-src 'self' https://cdn.csp.example.com")
+		_, _ = w.Write([]byte(`<html><head>` +
+			`<meta http-equiv="content-security-policy" content="img-src https://img.meta.example.net">` +
+			`<meta http-equiv="refresh" content="0; url=https://refresh.example.io">` +
+			`</head><a href="https://body.example.org">x</a></html>`))
+	}))
+	defer srv.Close()
+
+	do := func(t *testing.T, options Options) *Response {
+		ht, err := New(&options)
+		require.Nil(t, err)
+		t.Cleanup(ht.Dialer.Close)
+		req, err := retryablehttp.NewRequest(http.MethodGet, srv.URL, nil)
+		require.Nil(t, err)
+		resp, err := ht.Do(req, UnsafeOptions{})
+		require.Nil(t, err)
+		return resp
+	}
+
+	t.Run("csp only", func(t *testing.T) {
+		options := DefaultOptions
+		options.ExtractCSP = true
+		resp := do(t, options)
+		require.NotNil(t, resp.CSPData)
+		require.Contains(t, resp.CSPData.Domains, "example.com")
+		require.Contains(t, resp.CSPData.Fqdns, "cdn.csp.example.com")
+		require.Contains(t, resp.CSPData.Fqdns, "img.meta.example.net")
+		require.NotContains(t, resp.CSPData.Domains, "example.io")
+		require.Nil(t, resp.BodyDomains)
+	})
+
+	t.Run("efqdn extracts CSP and body domains", func(t *testing.T) {
+		options := DefaultOptions
+		options.ExtractFqdn = true
+		resp := do(t, options)
+		require.NotNil(t, resp.CSPData)
+		require.Contains(t, resp.CSPData.Fqdns, "cdn.csp.example.com")
+		require.NotNil(t, resp.BodyDomains)
+		require.Contains(t, resp.BodyDomains.Domains, "example.org")
+		require.Contains(t, resp.BodyDomains.Fqdns, "body.example.org")
+	})
+
+	t.Run("nothing extracted by default", func(t *testing.T) {
+		resp := do(t, DefaultOptions)
+		require.Nil(t, resp.CSPData)
+		require.Nil(t, resp.BodyDomains)
+	})
+}
+
+// Browsers no longer send Accept-Charset and some WAFs block it (discussion #2242).
+func TestNewRequestOmitsAcceptCharset(t *testing.T) {
+	h := &HTTPX{Options: &Options{DefaultUserAgent: "httpx"}}
+	req, err := h.NewRequest(http.MethodGet, "https://example.com")
+	require.NoError(t, err)
+	require.NotContains(t, req.Header, "Accept-Charset")
+	require.Equal(t, "httpx", req.Header.Get("User-Agent"))
+}

@@ -1,0 +1,54 @@
+name: 👤 Generate PGO
+
+on:
+  workflow_dispatch: {}
+  workflow_call: {}
+
+permissions: {}
+
+jobs:
+  pgo:
+    runs-on: ubuntu-latest
+    if: github.repository == 'projectdiscovery/nuclei'
+    permissions:
+      contents: read
+    env:
+      GITHUB_TOKEN: "${{ github.token }}"
+      PGO_FILE: "cmd/nuclei/default.pgo"
+      TARGET: "https://honey.scanme.sh"
+      TARGET_COUNT: "100"
+      TARGET_LIST: "/tmp/targets.txt"
+      PROFILE_MEM: "/tmp/nuclei-profile"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: projectdiscovery/actions/setup/go@3037fcdc8e8ea0807b5bce596eabc6f919d9e3c5 # v1
+      - uses: projectdiscovery/nuclei-action/cache@b5cad2ce0285c9d0c60402ee5972e40c08b3a47c # v3
+      - run: |
+          for i in {1..${{ env.TARGET_COUNT }}}; do
+              echo "${{ env.TARGET }}/-/?_=${i}" >> "${{ env.TARGET_LIST }}";
+          done
+      - run: make build
+      - run: ./bin/nuclei -update-templates
+      - run: |
+          ./bin/nuclei -silent -list="${TARGET_LIST}" \
+            -disable-update-check \
+            -no-mhe -no-httpx \
+            -code -dast -file -headless \
+            -enable-self-contained -enable-global-matchers \
+            -rate-limit=0 \
+            -concurrency=250 \
+            -headless-concurrency=100 \
+            -payload-concurrency=250 \
+            -bulk-size=250 \
+            -headless-bulk-size=100 \
+            -profile-mem="${PROFILE_MEM}" \
+        env:
+          DISABLE_STDOUT: "1"
+      - run: mv "${PROFILE_MEM}.cpu" "${PGO_FILE}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: "pgo"
+          path: "${{ env.PGO_FILE }}"
+          overwrite: true

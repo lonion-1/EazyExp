@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T06:51:01.456196+00:00",
+  "name": "nuclei",
+  "repo": "projectdiscovery/nuclei",
+  "branch": "dev",
+  "license": "MIT",
+  "stars": 33345,
+  "commit_sha": "f710b6d892235553e66395d6664ade6e743c20f2",
+  "last_commit_date": "2026-11-26T21:14:14Z",
+  "files_count": 1548,
+  "total_bytes": 8511958,
+  "output_dir": "./loot_kode/nuclei"
+}

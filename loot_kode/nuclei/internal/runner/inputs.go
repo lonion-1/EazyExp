@@ -1,0 +1,117 @@
+package runner
+
+import (
+	"context"
+	"fmt"
+	"sync/atomic"
+	"time"
+
+	"github.com/pkg/errors"
+	"github.com/projectdiscovery/hmap/store/hybrid"
+	"github.com/projectdiscovery/httpx/common/httpx"
+	"github.com/projectdiscovery/nuclei/v3/pkg/input"
+	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
+	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+	syncutil "github.com/projectdiscovery/utils/sync"
+)
+
+// initializeTemplatesHTTPInput initializes the http form of input
+// for any loaded http templates if input is in non-standard format.
+// templateCount is used for progress reporting during the probing phase.
+func (r *Runner) initializeTemplatesHTTPInput(templateCount int64) (*hybrid.HybridMap, error) {
+	hm, err := hybrid.New(hybrid.DefaultDiskOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create temporary input file")
+	}
+	if r.inputProvider.InputType() == provider.MultiFormatInputProvider {
+		// currently http probing for input mode types is not supported
+		return hm, nil
+	}
+	r.Logger.Info().Msgf("Running httpx on input host")
+
+	// report probing progress through the stats ticker (-stats), which
+	// otherwise stays silent for the whole probing phase on large lists
+	var probeTracker progress.ProbeTracker
+	if tracker, ok := r.progress.(progress.ProbeTracker); ok {
+		var probeTotal int64
+		r.inputProvider.Iterate(func(value *contextargs.MetaInput) bool {
+			if !stringsutil.HasPrefixAny(value.Input, "http://", "https://") {
+				probeTotal++
+			}
+			return true
+		})
+		if probeTotal > 0 {
+			probeTracker = tracker
+			probeTracker.InitProbe(r.inputProvider.Count(), templateCount, probeTotal)
+		}
+	}
+
+	httpxOptions := httpx.DefaultOptions
+	if r.options.AliveHttpProxy != "" {
+		httpxOptions.Proxy = r.options.AliveHttpProxy
+	} else if r.options.AliveSocksProxy != "" {
+		httpxOptions.Proxy = r.options.AliveSocksProxy
+	}
+	httpxOptions.RetryMax = r.options.Retries
+	httpxOptions.Timeout = time.Duration(r.options.Timeout) * time.Second
+	if len(r.options.InternalResolversList) > 0 {
+		httpxOptions.Resolvers = r.options.InternalResolversList
+	}
+
+	dialers := protocolstate.GetDialersWithId(r.options.ExecutionId)
+	if dialers == nil {
+		return nil, fmt.Errorf("dialers not initialized for %s", r.options.ExecutionId)
+	}
+
+	httpxOptions.NetworkPolicy = dialers.NetworkPolicy
+	httpxClient, err := httpx.New(&httpxOptions)
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create httpx client")
+	}
+
+	// Probe the non-standard URLs and store them in cache
+	// syncutil.New rejects a size below 1, so a -bs below 1 probes one at a time.
+	bulkSize := max(r.options.BulkSize, 1)
+
+	swg, err := syncutil.New(syncutil.WithSize(bulkSize))
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create adaptive group")
+	}
+	var count atomic.Int32
+	r.inputProvider.Iterate(func(value *contextargs.MetaInput) bool {
+		if stringsutil.HasPrefixAny(value.Input, "http://", "https://") {
+			return true
+		}
+
+		if r.options.ProbeConcurrency > 0 && swg.Size != r.options.ProbeConcurrency {
+			if err := swg.Resize(context.Background(), r.options.ProbeConcurrency); err != nil {
+				r.Logger.Error().Msgf("Could not resize workpool: %s\n", err)
+			}
+		}
+
+		swg.Add()
+		go func(target *contextargs.MetaInput) {
+			defer swg.Done()
+
+			// a pinned target is probed through its ip, and each ip keeps its
+			// own result, as servers of one host may serve different schemes
+			ctx := contextargs.WithCustomIP(context.Background(), target)
+			if result := utils.ProbeURLWithContext(ctx, target.Input, httpxClient); result != "" {
+				count.Add(1)
+				_ = hm.Set(input.ProbeKey(target.Input, target.CustomIP), []byte(result))
+			}
+			if probeTracker != nil {
+				probeTracker.IncrementProbes()
+			}
+		}(value)
+		return true
+	})
+	swg.Wait()
+
+	r.Logger.Info().Msgf("Found %d URL from httpx", count.Load())
+	return hm, nil
+}

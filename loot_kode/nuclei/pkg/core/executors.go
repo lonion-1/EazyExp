@@ -1,0 +1,600 @@
+package core
+
+import (
+	"context"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/projectdiscovery/nuclei/v3/pkg/input/normalize"
+	"github.com/projectdiscovery/nuclei/v3/pkg/input/provider"
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/progress"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http" //nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+	"github.com/projectdiscovery/nuclei/v3/pkg/scan"
+	"github.com/projectdiscovery/nuclei/v3/pkg/templates"
+	"github.com/projectdiscovery/nuclei/v3/pkg/templates/types"
+	generalTypes "github.com/projectdiscovery/nuclei/v3/pkg/types"
+	syncutil "github.com/projectdiscovery/utils/sync"
+)
+
+// Executors are low level executors that deals with template execution on a target
+
+// executeAllSelfContained executes all self contained templates that do not use `target`
+func (e *Engine) executeAllSelfContained(ctx context.Context, alltemplates []*templates.Template, results *atomic.Bool, sg *sync.WaitGroup) {
+	for _, v := range alltemplates {
+		usesSharedTemplateBudget := v.Type() != types.HeadlessProtocol
+		if usesSharedTemplateBudget {
+			if err := e.options.AcquireTemplateThread(ctx); err != nil {
+				return
+			}
+		}
+		sg.Add(1)
+		go func(template *templates.Template, sharedBudget bool) {
+			defer sg.Done()
+			if sharedBudget {
+				defer e.options.ReleaseTemplateThread()
+			}
+			defer e.tasksDone(1)
+			planned, skip := e.claimPlanned(template, &contextargs.MetaInput{})
+			if skip {
+				return
+			}
+			finished := e.templateExecutionStarted(template, "")
+			defer func() { finished(ctx.Err()) }()
+			var err error
+			var match bool
+			ctx := scan.NewScanContext(ctx, contextargs.New(ctx))
+			if e.Callback != nil {
+				if results, err := template.Executer.ExecuteWithResults(ctx); err == nil {
+					for _, result := range results {
+						e.Callback(result)
+					}
+				}
+
+				match = true
+			} else {
+				match, err = template.Executer.Execute(ctx)
+			}
+			if err != nil {
+				e.options.Logger.Warning().Msgf("[%s] Could not execute step (self-contained): %s\n", e.executerOpts.Colorizer.BrightBlue(template.ID), err)
+			} else if ctx.Context().Err() == nil {
+				planned()
+			}
+			results.CompareAndSwap(false, match)
+		}(v, usesSharedTemplateBudget)
+	}
+}
+
+// executeTemplateWithTargets executes a given template on x targets (with a internal targetpool(i.e concurrency))
+func (e *Engine) executeTemplateWithTargets(ctx context.Context, template *templates.Template, target provider.InputProvider, results *atomic.Bool) {
+	if e.workPool == nil {
+		e.workPool = e.GetWorkPool()
+	}
+	// Bounded worker pool using input concurrency
+	workerCount := e.workPool.InputPool(template.Type()).Size
+
+	var (
+		index uint32
+	)
+
+	currentInfo, resumeFromInfo := e.resumeInfo(template.ID)
+
+	// track progression
+	cleanupInFlight := func(index uint32) {
+		currentInfo.Lock()
+		delete(currentInfo.InFlight, index)
+		currentInfo.Unlock()
+	}
+
+	// task represents a single target execution unit
+	type task struct {
+		index uint32
+		skip  bool
+		value *contextargs.MetaInput
+	}
+
+	tasks := make(chan task)
+	var workersWg sync.WaitGroup
+	workersWg.Add(workerCount)
+	for i := 0; i < workerCount; i++ {
+		go func() {
+			defer workersWg.Done()
+			for t := range tasks {
+				func() {
+					// A target that cancellation cut off didn't finish. It stays in
+					// flight, so the resumed scan runs it again.
+					defer func() {
+						if ctx.Err() == nil {
+							cleanupInFlight(t.index)
+						}
+					}()
+					select {
+					case <-ctx.Done():
+						return
+					default:
+					}
+					if t.skip {
+						return
+					}
+
+					match, err := e.executeTemplateOnInput(ctx, template, t.value)
+					if err != nil {
+						e.options.Logger.Warning().Msgf("[%s] Could not execute step on %s: %s\n", template.ID, t.value.Input, err)
+					}
+					results.CompareAndSwap(false, match)
+				}()
+			}
+		}()
+	}
+
+	target.Iterate(func(scannedValue *contextargs.MetaInput) bool {
+		select {
+		case <-ctx.Done():
+			return false // exit
+		default:
+		}
+
+		// Best effort to track the host progression
+		// skips indexes lower than the minimum in-flight at interruption time
+		var skip bool
+		if resumeFromInfo.IsCompleted() { // the template was completed
+			e.options.Logger.Debug().Msgf("[%s] Skipping \"%s\": Resume - Template already completed", template.ID, scannedValue.Input)
+			skip = true
+		} else if index < resumeFromInfo.GetSkipUnder() { // index lower than the sliding window (bulk-size)
+			e.options.Logger.Debug().Msgf("[%s] Skipping \"%s\": Resume - Target already processed", template.ID, scannedValue.Input)
+			skip = true
+		} else if resumeFromInfo.IsInFlight(index) { // the target wasn't completed successfully
+			e.options.Logger.Debug().Msgf("[%s] Repeating \"%s\": Resume - Target wasn't completed", template.ID, scannedValue.Input)
+			// skip is already false, but leaving it here for clarity
+			skip = false
+		} else if index > resumeFromInfo.GetDoAbove() { // index above the sliding window (bulk-size)
+			// skip is already false - but leaving it here for clarity
+			skip = false
+		}
+
+		// out of scope pairs keep their index so resume positions stay stable
+		inScope := e.inScope(template, scannedValue)
+		if !inScope {
+			skip = true
+		}
+
+		// A skipped position never runs, so cancellation can't cut it off. Marking
+		// it would let an interrupt save it as unfinished, below the progress this
+		// scan loaded, and the next scan would repeat targets that are done.
+		if !skip {
+			currentInfo.Lock()
+			currentInfo.InFlight[index] = struct{}{}
+			currentInfo.Unlock()
+		}
+
+		// Skip if the host has had errors
+		var hostDown bool
+		if inScope {
+			hostDown, _ = e.hostDown(ctx, template, scannedValue)
+		}
+		// in-scope pairs that never reach executeTemplateOnInput are done here:
+		// those done by the resumed scan and those of an unresponsive host
+		if inScope && (skip || hostDown) {
+			e.tasksDone(1)
+		}
+		if hostDown {
+			skipEvent := &output.ResultEvent{
+				TemplateID:    template.ID,
+				TemplatePath:  template.Path,
+				Info:          template.Info,
+				Type:          template.Type().String(),
+				Host:          scannedValue.Input,
+				MatcherStatus: false,
+				Error:         "host was skipped as it was found unresponsive",
+				Timestamp:     time.Now(),
+			}
+
+			if e.Callback != nil {
+				e.Callback(skipEvent)
+			} else if e.executerOpts.Output != nil {
+				_ = e.executerOpts.Output.Write(skipEvent)
+			}
+			// This target still occupies its resume index. Leaving the index in
+			// place would hand it to the next target, and a resumed scan would
+			// skip that target as already processed.
+			cleanupInFlight(index)
+			index++
+			return true
+		}
+
+		tasks <- task{index: index, skip: skip, value: scannedValue}
+		index++
+		return true
+	})
+
+	close(tasks)
+	workersWg.Wait()
+
+	// A cancelled loop never took the remaining targets, so the template isn't
+	// complete.
+	if ctx.Err() != nil {
+		return
+	}
+
+	// on completion marks the template as completed
+	currentInfo.Lock()
+	currentInfo.Completed = true
+	currentInfo.Unlock()
+}
+
+// resumeInfo returns the progress under key in this scan and in the scan it
+// resumes from, and creates the ones that don't exist yet.
+func (e *Engine) resumeInfo(key string) (*generalTypes.ResumeInfo, *generalTypes.ResumeInfo) {
+	cfg := e.executerOpts.ResumeCfg
+	cfg.Lock()
+	defer cfg.Unlock()
+
+	return resumeInfoLocked(cfg, key)
+}
+
+// resumeInfoLocked is resumeInfo for a caller that holds cfg's lock.
+func resumeInfoLocked(cfg *generalTypes.ResumeCfg, key string) (*generalTypes.ResumeInfo, *generalTypes.ResumeInfo) {
+	current, exists := cfg.Current[key]
+	if !exists {
+		current = new(generalTypes.ResumeInfo)
+		cfg.Current[key] = current
+	}
+
+	current.InitInFlight()
+
+	resumeFrom, exists := cfg.ResumeFrom[key]
+	if !exists {
+		resumeFrom = new(generalTypes.ResumeInfo)
+		cfg.ResumeFrom[key] = resumeFrom
+	}
+
+	return current, resumeFrom
+}
+
+// hostSprayResumeInfo returns the progress of a host-spray run in this scan and
+// in the scan it resumes from.
+//
+// The resume file has one entry for host-spray, but an engine runs host-spray
+// once per ExecuteScanWithOpts call, as -auto-tech does, and the engines of -as
+// share one resume config. The progress of one run can't stand for the others,
+// and a finished run would mark the entry as completed for a run still going.
+// Only the first run tracks. A later run gets progress that no one saves and
+// resets the entry to an empty one in both maps, so a resumed scan starts from
+// the first target, as it did before host-spray saved progress. The entry in
+// Current stays, because a missing one would let a third run track again. The
+// one in ResumeFrom is reset too, because a scan that saves what it loaded for
+// the entries it left idle would otherwise save a stale loaded one, such as a
+// completed one, in every file it writes.
+func (e *Engine) hostSprayResumeInfo() (*generalTypes.ResumeInfo, *generalTypes.ResumeInfo) {
+	cfg := e.executerOpts.ResumeCfg
+	cfg.Lock()
+	defer cfg.Unlock()
+
+	if _, taken := cfg.Current[hostSprayResumeID]; !taken {
+		return resumeInfoLocked(cfg, hostSprayResumeID)
+	}
+
+	empty := func() *generalTypes.ResumeInfo {
+		info := new(generalTypes.ResumeInfo)
+		info.InitInFlight()
+
+		return info
+	}
+	cfg.Current[hostSprayResumeID] = empty()
+	cfg.ResumeFrom[hostSprayResumeID] = empty()
+
+	return empty(), empty()
+}
+
+// executeTemplatesOnTarget execute given templates on given single target
+func (e *Engine) executeTemplatesOnTarget(ctx context.Context, alltemplates []*templates.Template, target *contextargs.MetaInput, results *atomic.Bool) {
+	// all templates are executed on single target
+
+	// wp is workpool that contains different waitgroups for
+	// headless and non-headless templates
+	// global waitgroup should not be used here
+	wp := e.GetWorkPool()
+	defer wp.Wait()
+
+	// reported is set once a skip event stands for the target's own address
+	var reported bool
+
+	for _, tpl := range alltemplates {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if !e.inScope(tpl, target) {
+			continue
+		}
+
+		// A target whose own address is down gets one event, not one per
+		// template (#7049). That address stays down, so after the event the
+		// templates that send only to the target are skipped without one.
+		if reported && sendsOnlyToTarget(tpl) {
+			e.tasksDone(1)
+
+			continue
+		}
+
+		// Check whether the target has already been marked as permanently
+		// unresponsive by HostErrorsCache before spawning another goroutine.
+		if down, perTemplate := e.hostDown(ctx, tpl, target); down {
+			reported = reported || !perTemplate
+
+			skipEvent := &output.ResultEvent{
+				TemplateID:    tpl.ID,
+				TemplatePath:  tpl.Path,
+				Info:          tpl.Info,
+				Type:          tpl.Type().String(),
+				Host:          target.Input,
+				MatcherStatus: false,
+				Error:         "host was skipped as it was found unresponsive",
+				Timestamp:     time.Now(),
+			}
+			if e.Callback != nil {
+				e.Callback(skipEvent)
+			} else if e.executerOpts.Output != nil {
+				_ = e.executerOpts.Output.Write(skipEvent)
+			}
+
+			e.tasksDone(1)
+
+			continue
+		}
+
+		// resize check point - nop if there are no changes
+		wp.RefreshWithConfigContext(ctx, e.GetWorkPoolConfig())
+
+		var sg *syncutil.AdaptiveWaitGroup
+		if tpl.Type() == types.HeadlessProtocol {
+			sg = wp.Headless
+		} else {
+			sg = wp.Default
+		}
+		if err := sg.AddWithContext(ctx); err != nil {
+			return
+		}
+		usesSharedTemplateBudget := tpl.Type() != types.HeadlessProtocol
+		if usesSharedTemplateBudget {
+			if err := e.options.AcquireTemplateThread(ctx); err != nil {
+				sg.Done()
+				return
+			}
+		}
+		go func(template *templates.Template, value *contextargs.MetaInput, wg *syncutil.AdaptiveWaitGroup, sharedBudget bool) {
+			defer wg.Done()
+			if sharedBudget {
+				defer e.options.ReleaseTemplateThread()
+			}
+
+			match, err := e.executeTemplateOnInput(ctx, template, value)
+			if err != nil {
+				e.options.Logger.Warning().Msgf("[%s] Could not execute step on %s: %s\n", template.ID, value.Input, err)
+			}
+			results.CompareAndSwap(false, match)
+		}(tpl, target, sg, usesSharedTemplateBudget)
+	}
+}
+
+// hostDown reports whether the host errors cache marks value unresponsive for
+// template, and whether the failure is at the address the http requests of a
+// value without a scheme go to rather than at value's own. The cache records
+// http failures at the address each request went to, which for a value without
+// a scheme is by default the URL its http probe found, or https, as
+// retryablehttp fills it in (#8180).
+//
+// Only a template that sends only to the target (sendsOnlyToTarget) is skipped.
+// The engine cannot tell which address another template dials, such as another
+// port (#8197) or another protocol (#8203), so that template runs, and its
+// http, network and ssl requests check the address each one dials.
+func (e *Engine) hostDown(
+	ctx context.Context, template *templates.Template, value *contextargs.MetaInput,
+) (bool, bool) {
+	cache := e.executerOpts.HostErrorsCache
+	if cache == nil || !sendsOnlyToTarget(template) {
+		return false, false
+	}
+
+	protoType := template.Type().String()
+	if cache.Check(protoType, contextargs.NewWithMetaInput(ctx, value)) {
+		return true, false
+	}
+
+	if strings.Contains(value.Input, "://") {
+		return false, false
+	}
+
+	target := value.Input
+	if helper := e.executerOpts.InputHelper; helper != nil {
+		target = helper.TransformPinned(target, value.CustomIP, types.HTTPProtocol)
+	}
+
+	if !strings.Contains(target, "://") {
+		target = "https://" + target
+	}
+
+	httpValue := value.Clone()
+	httpValue.Input = target
+
+	return cache.Check(protoType, contextargs.NewWithMetaInput(ctx, httpValue)), true
+}
+
+// onlyHTTP reports whether all requests of template are http.
+func onlyHTTP(template *templates.Template) bool {
+	return len(template.RequestsHTTP) > 0 && template.Requests() == len(template.RequestsHTTP)
+}
+
+// sendsOnlyToTarget reports whether the requests of template are all http and
+// none of them may go to an address other than its target's.
+func sendsOnlyToTarget(template *templates.Template) bool {
+	return onlyHTTP(template) && !slices.ContainsFunc(template.RequestsHTTP, (*http.Request).MaySendElsewhere)
+}
+
+// inScope reports whether per-target profiles select template for input.
+func (e *Engine) inScope(template *templates.Template, input *contextargs.MetaInput) bool {
+	selection := e.selectionFor(input)
+	return selection == nil || template.SelectedBy(selection)
+}
+
+// selectionFor returns the templates per-target profiles select for input; nil
+// selects every template.
+func (e *Engine) selectionFor(input *contextargs.MetaInput) protocols.TemplateSelection {
+	if e.executerOpts.TargetScope == nil {
+		return nil
+	}
+	return e.executerOpts.TargetScope.For(input)
+}
+
+// taskTracker returns the progress when it counts tasks, nil otherwise.
+func (e *Engine) taskTracker() progress.TaskTracker {
+	if e.executerOpts == nil {
+		return nil
+	}
+	tracker, _ := e.executerOpts.Progress.(progress.TaskTracker)
+	return tracker
+}
+
+// addTaskTotal adds count tasks to the total when the progress counts tasks.
+func (e *Engine) addTaskTotal(count int64) {
+	if tracker := e.taskTracker(); tracker != nil {
+		tracker.AddToTaskTotal(count)
+	}
+}
+
+// tasksDone marks count tasks as done when the progress counts tasks.
+func (e *Engine) tasksDone(count int64) {
+	if tracker := e.taskTracker(); tracker != nil {
+		tracker.IncrementTasksBy(count)
+	}
+}
+
+// executeTemplateOnInput performs template execution for a single input and returns match status and error
+func (e *Engine) executeTemplateOnInput(ctx context.Context, template *templates.Template, value *contextargs.MetaInput) (matched bool, err error) {
+	// a pair skipped as a repeat of its origin is done as well
+	defer e.tasksDone(1)
+	planned, skip := e.claimPlanned(template, value)
+	if skip {
+		return false, nil
+	}
+	// an origin a sibling already covered is settled too, so it is recorded
+	defer func() {
+		if err == nil && ctx.Err() == nil {
+			planned()
+		}
+	}()
+	// A template fixed to the target's origin makes the same requests for every
+	// target that shares one, which a crawled list produces by the hundred.
+	// Running it once per origin sends exactly the same traffic, minus the
+	// repeats. The reservation is kept only when execution succeeds, so a
+	// failed attempt leaves the origin free for a later target.
+	finish, run := e.claimOriginScoped(template, value)
+	if !run {
+		return false, nil
+	}
+	defer func() { finish(err == nil) }()
+	finished := e.templateExecutionStarted(template, value.Input)
+	defer func() { finished(ctx.Err()) }()
+	// every protocol dials the target's host through its pinned ip, if any
+	pinnedCtx := contextargs.WithCustomIP(ctx, value)
+	ctxArgs := contextargs.New(pinnedCtx)
+	ctxArgs.MetaInput = value
+	scanCtx := scan.NewScanContext(pinnedCtx, ctxArgs)
+
+	switch template.Type() {
+	case types.WorkflowProtocol:
+		return e.executeWorkflow(scanCtx, template.CompiledWorkflow), nil
+	default:
+		if e.Callback != nil {
+			results, execErr := template.Executer.ExecuteWithResults(scanCtx)
+			if execErr != nil {
+				return false, execErr
+			}
+			for _, result := range results {
+				e.Callback(result)
+			}
+			if e.resultHook != nil {
+				e.resultHook(value, results)
+			}
+			return len(results) > 0, nil
+		}
+		matched, err = template.Executer.Execute(scanCtx)
+		if e.resultHook != nil {
+			e.resultHook(value, scanCtx.GenerateResult())
+		}
+		return matched, err
+	}
+}
+
+// originAttempt is one origin-scoped execution. done is set only after a
+// successful run. While inflight is set, other callers wait, then retry if
+// that attempt failed.
+type originAttempt struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	inflight bool
+	done     bool
+}
+
+func newOriginAttempt() *originAttempt {
+	attempt := &originAttempt{}
+	attempt.cond = sync.NewCond(&attempt.mu)
+	return attempt
+}
+
+// originScopeKey returns the key an origin-scoped template runs once per, and
+// false when the template runs on every target.
+func originScopeKey(template *templates.Template, value *contextargs.MetaInput) (string, bool) {
+	if template == nil || value == nil || !template.IsOriginScoped() {
+		return "", false
+	}
+	origin := normalize.Origin(value.Input)
+	if origin == "" {
+		return "", false
+	}
+	return template.ID + "\x00" + origin + "\x00" + value.CustomIP, true
+}
+
+// claimOriginScoped reports whether this caller should execute an origin-scoped
+// template. finish(true) records a successful run. finish(false) releases the
+// claim so a later target, including one that waited, can try again. Templates
+// whose requests depend on the target path always run. CustomIP is part of the
+// key so each address selected for one URL is tested on its own.
+func (e *Engine) claimOriginScoped(template *templates.Template, value *contextargs.MetaInput) (finish func(bool), run bool) {
+	noop := func(bool) {}
+	key, scoped := originScopeKey(template, value)
+	if !scoped {
+		return noop, true
+	}
+	actual, _ := e.originScoped.LoadOrStore(key, newOriginAttempt())
+	slot := actual.(*originAttempt)
+
+	slot.mu.Lock()
+	for {
+		if slot.done {
+			slot.mu.Unlock()
+			return noop, false
+		}
+		if !slot.inflight {
+			slot.inflight = true
+			slot.mu.Unlock()
+			return func(success bool) {
+				slot.mu.Lock()
+				slot.inflight = false
+				if success {
+					slot.done = true
+				}
+				slot.cond.Broadcast()
+				slot.mu.Unlock()
+			}, true
+		}
+		slot.cond.Wait()
+	}
+}

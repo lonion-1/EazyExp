@@ -1,0 +1,2370 @@
+package http
+
+//nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+import (
+	"bytes"
+	"context"
+	"encoding/hex"
+	stderrors "errors"
+	"fmt"
+	"io"
+	"maps"
+	"net"
+	"net/http"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/pkg/errors"
+	"go.uber.org/multierr"
+	"moul.io/http2curl"
+
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v3/pkg/fuzz/analyzers"
+	"github.com/projectdiscovery/nuclei/v3/pkg/fuzz/component"
+	fuzzStats "github.com/projectdiscovery/nuclei/v3/pkg/fuzz/stats"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators/extractors"
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/expressions"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/helpers/eventcreator"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/helpers/responsehighlighter"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hostbackoff"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hostratelimit"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/marker"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/protocolstate"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/utils/vardump"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/catchall"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpcache"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httpclientpool"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/httputils"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/signer"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/http/signerpool"
+	templateTypes "github.com/projectdiscovery/nuclei/v3/pkg/templates/types"
+	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+	"github.com/projectdiscovery/nuclei/v3/pkg/types/nucleierr"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/httpbody"
+	"github.com/projectdiscovery/rawhttp"
+	"github.com/projectdiscovery/retryablehttp-go"
+	convUtil "github.com/projectdiscovery/utils/conversion"
+	"github.com/projectdiscovery/utils/errkit"
+	httpUtils "github.com/projectdiscovery/utils/http"
+	iputil "github.com/projectdiscovery/utils/ip"
+	sliceutil "github.com/projectdiscovery/utils/slice"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+	unitutils "github.com/projectdiscovery/utils/unit"
+	urlutil "github.com/projectdiscovery/utils/url"
+)
+
+const (
+	defaultMaxWorkers = 150
+	// max unique errors to store & combine
+	// when executing requests in parallel
+	maxErrorsWhenParallel = 3
+)
+
+var (
+	MaxBodyRead = 10 * unitutils.Mega
+	// ErrMissingVars is error occurred when variables are missing
+	ErrMissingVars = errkit.New("stop execution due to unresolved variables").SetKind(nucleierr.ErrTemplateLogic).Build()
+	// ErrHttpEngineRequestDeadline is error occurred when request deadline set by http request engine is exceeded
+	ErrHttpEngineRequestDeadline = errkit.New("http request engine deadline exceeded").SetKind(errkit.ErrKindDeadline).Build()
+)
+
+// Type returns the type of the protocol request
+func (request *Request) Type() templateTypes.ProtocolType {
+	return templateTypes.HTTPProtocol
+}
+
+// hostBackoffKey is the identity shared by the pre-request wait and the
+// post-response observation. It keeps the scheme, or an explicit port, so
+// NormalizeHostPort does not record an https target under port 80.
+func hostBackoffKey(req *generatedRequest, input *contextargs.Context) string {
+	if req != nil {
+		if key := req.URL(); key != "" {
+			return key
+		}
+		if req.request != nil && req.request.Request != nil && req.request.Request.URL != nil {
+			return req.request.Request.URL.String()
+		}
+	}
+	if input != nil && input.MetaInput != nil {
+		return input.MetaInput.Input
+	}
+	return ""
+}
+
+// observeHostBackoff reports one request outcome to the per-host governor.
+func (request *Request) observeHostBackoff(host string, resp *http.Response, err error) {
+	if request.options == nil || request.options.HostBackoff == nil {
+		return
+	}
+	// A cancelled sibling, or a scan that is stopping, is not the host asking
+	// for less traffic. A real status on the response is still worth recording.
+	if resp == nil && err != nil && stderrors.Is(err, context.Canceled) {
+		return
+	}
+	statusCode := 0
+	var retryAfter time.Duration
+	if resp != nil {
+		statusCode = resp.StatusCode
+		retryAfter = hostbackoff.RetryAfter(resp.Header.Get("Retry-After"))
+	}
+	request.options.HostBackoff.Observe(hostratelimit.NormalizeHostPort(host), statusCode, retryAfter, err)
+}
+
+// waitHostBackoff pauses for the delay this host has already earned.
+func (request *Request) waitHostBackoff(ctx context.Context, host string) error {
+	if request.options == nil {
+		return nil
+	}
+	return request.options.HostBackoffWait(ctx, host)
+}
+
+// rateLimitTake first honours any backoff the host earned by signalling it is
+// overloaded, so a blocking target is paced regardless of which limiter is in play.
+func (request *Request) rateLimitTake(ctx context.Context, hostname string) error {
+	if err := request.waitHostBackoff(ctx, hostname); err != nil {
+		return err
+	}
+	return request.options.RateLimitTakeContext(ctx, hostname)
+}
+
+// stopWithHandler ends when parent ends or the handler stops, so a backoff
+// wait does not outlive stop-at-first-match.
+func stopWithHandler[T comparable](parent context.Context, handler *httputils.StopAtFirstMatchHandler[T]) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if handler == nil {
+		return ctx, cancel
+	}
+	if handler.Context().Err() != nil {
+		cancel()
+		return ctx, func() {}
+	}
+	stop := context.AfterFunc(handler.Context(), cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
+}
+
+// executeRaceRequest executes race condition request for a URL
+func (request *Request) executeRaceRequest(input *contextargs.Context, dynamicValues, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
+	reqURL := input.MetaInput.Input
+	var generatedRequests []*generatedRequest
+
+	// The total of the block is race_count, however many entries it has: it only
+	// sends copies of the first one. Each copy counts when it starts, and the
+	// ones left unsent count as processed on return (#7838), so the count ends
+	// at the total.
+	started := 0
+
+	defer func() {
+		if unsent := request.RaceNumberRequests - started; unsent > 0 {
+			request.options.Progress.SetRequests(uint64(unsent))
+		}
+	}()
+
+	// Requests within race condition should be dumped once and the output prefilled to allow DSL language to work
+	// This will introduce a delay and will populate in hacky way the field "request" of outputEvent
+	generator := request.newGenerator(false)
+
+	inputData, payloads, ok := generator.nextValue()
+	if !ok {
+		return nil
+	}
+	ctx := input.Context()
+	requestForDump, err := generator.Make(ctx, input, inputData, payloads, dynamicValues)
+	if err != nil {
+		return err
+	}
+	request.setCustomHeaders(requestForDump)
+	// Auth is applied again on each raced request. The dump is what replay
+	// sends, so it has to include the same headers.
+	if !request.SkipSecretFile {
+		requestForDump.ApplyAuth(request.options.AuthProvider)
+	}
+	dumpedRequest, err := dump(requestForDump, reqURL, 0)
+	if err != nil {
+		return err
+	}
+	dumpedRequestString := convUtil.String(dumpedRequest.data)
+	savedRequest := convUtil.String(capDumpBody(dumpedRequest.data, request.options.Options.RequestSaveSize))
+	if request.options.Options.Debug || request.options.Options.DebugRequests || request.options.Options.StoreResponse {
+		msg := fmt.Sprintf("[%s] Dumped HTTP request for %s\n\n", request.options.TemplateID, reqURL)
+		if request.options.Options.Debug || request.options.Options.DebugRequests {
+			gologger.Info().Msg(msg)
+			gologger.Print().Msgf("%s", savedRequest)
+		}
+		if request.options.Options.StoreResponse {
+			request.options.Output.WriteStoreDebugData(reqURL, request.options.TemplateID, request.Type().String(), fmt.Sprintf("%s\n%s", msg, savedRequest))
+		}
+	}
+	previous["request"] = dumpedRequestString
+
+	// Pre-Generate requests
+	for i := 0; i < request.RaceNumberRequests; i++ {
+		generator := request.newGenerator(false)
+		inputData, payloads, ok := generator.nextValue()
+		if !ok {
+			break
+		}
+		ctx := input.Context()
+		generatedRequest, err := generator.Make(ctx, input, inputData, payloads, dynamicValues)
+		if err != nil {
+			return err
+		}
+		generatedRequests = append(generatedRequests, generatedRequest)
+	}
+
+	shouldStop := (request.options.Options.StopAtFirstMatch || request.StopAtFirstMatch || request.options.StopAtFirstMatch)
+
+	childCtx, cancel := context.WithCancel(input.Context())
+	defer cancel()
+
+	spmHandler := httputils.NewNonBlockingSPMHandler[error](childCtx, maxErrorsWhenParallel, shouldStop)
+	defer spmHandler.Cancel()
+
+	gotMatches := &atomic.Bool{}
+	// skipped notes that a request was not sent because its address is unresponsive.
+	var skipped atomic.Bool
+	// wrappedCallback is a callback that wraps the original callback
+	// to implement stop at first match logic
+	wrappedCallback := func(event *output.InternalWrappedEvent) {
+		if !event.HasOperatorResult() {
+			callback(event) // not required but we can allow it
+			return
+		}
+		// this will execute match condition such that if stop at first match is enabled
+		// this will be only executed once
+		spmHandler.MatchCallback(func() {
+			gotMatches.Store(true)
+			callback(event)
+		})
+		if shouldStop {
+			// stop all running requests and exit
+			spmHandler.Trigger()
+		}
+	}
+
+	for i := 0; i < request.RaceNumberRequests; i++ {
+		updatedInput := contextargs.GetCopyIfHostOutdated(input, generatedRequests[i].URL())
+
+		hostErrorsInput := contextargs.GetCopyIfAddressOutdated(input, generatedRequests[i].URL())
+		if spmHandler.FoundFirstMatch() || request.skipUnresponsive(hostErrorsInput, &skipped) {
+			// stop sending more requests condition is met
+			break
+		}
+		if err := spmHandler.Acquire(); err != nil {
+			break
+		}
+		// execute http request
+		go func(httpRequest *generatedRequest, requestInput, hostErrorsInput *contextargs.Context) {
+			defer spmHandler.Release()
+
+			if spmHandler.FoundFirstMatch() || request.skipUnresponsive(hostErrorsInput, &skipped) {
+				// stop sending more requests condition is met
+				return
+			}
+			waitCtx, cancelWait := stopWithHandler(requestInput.Context(), spmHandler)
+			err := request.waitHostBackoff(waitCtx, hostBackoffKey(httpRequest, requestInput))
+			cancelWait()
+			if err != nil || spmHandler.FoundFirstMatch() || spmHandler.Cancelled() {
+				if err != nil {
+					select {
+					case <-spmHandler.Done():
+					case spmHandler.ResultChan <- err:
+					}
+				}
+				return
+			}
+
+			err = request.executeRequest(requestInput, httpRequest, previous, false, wrappedCallback, 0)
+			select {
+			case <-spmHandler.Done():
+				return
+			case spmHandler.ResultChan <- err:
+				request.recordHostResultAndCancelIfUnresponsive(hostErrorsInput, err, spmHandler.Cancel)
+				return
+			}
+		}(generatedRequests[i], updatedInput, hostErrorsInput)
+
+		started++
+		request.options.Progress.IncrementRequests()
+	}
+	spmHandler.Wait()
+
+	if spmHandler.FoundFirstMatch() {
+		// ignore any context cancellation and in-transit execution errors
+		return nil
+	}
+
+	return requestsError(spmHandler.CombinedResults(), skipped.Load())
+}
+
+// executeParallelHTTP executes parallel requests for a template
+func (request *Request) executeParallelHTTP(input *contextargs.Context, dynamicValues output.InternalEvent, callback protocols.OutputEventCallback) error {
+	// Workers that keeps enqueuing new requests
+	maxWorkers := request.Threads
+
+	// if request threads matches global payload concurrency we follow it
+	shouldFollowGlobal := maxWorkers == request.options.Options.PayloadConcurrency
+
+	if protocolstate.IsLowOnMemory() {
+		maxWorkers = protocolstate.GuardThreadsOrDefault(request.Threads)
+	}
+
+	// Stop-at-first-match logic while executing requests
+	// parallelly using threads
+	shouldStop := (request.options.Options.StopAtFirstMatch || request.StopAtFirstMatch || request.options.StopAtFirstMatch)
+
+	workerCtx, cancelWorkers := context.WithCancel(input.Context())
+	defer cancelWorkers()
+
+	// The handler's goroutine runs until Wait or until the context passed to
+	// it ends; Cancel does not stop it. Some returns skip Wait, so that context
+	// ends with this function (#8181). It does not derive from the input: with
+	// stop-at-first-match, the handler would report the input's cancellation
+	// as a first match.
+	spmCtx, cancelSPM := context.WithCancel(context.Background())
+	defer cancelSPM()
+
+	spmHandler := httputils.NewBlockingSPMHandler[error](spmCtx, maxWorkers, maxErrorsWhenParallel, shouldStop)
+	defer spmHandler.Cancel()
+
+	// skipped notes that a request was not sent because its address is unresponsive.
+	var skipped atomic.Bool
+
+	// wrappedCallback is a callback that wraps the original callback
+	// to implement stop at first match logic
+	wrappedCallback := func(event *output.InternalWrappedEvent) {
+		if !event.HasOperatorResult() {
+			callback(event) // not required but we can allow it
+			return
+		}
+		// this will execute match condition such that if stop at first match is enabled
+		// this will be only executed once
+		spmHandler.MatchCallback(func() {
+			callback(event)
+		})
+		if shouldStop {
+			// stop all running requests and exit
+			spmHandler.Trigger()
+			cancelWorkers()
+		}
+	}
+
+	// bounded worker-pool to avoid spawning one goroutine per payload
+	type task struct {
+		req          *generatedRequest
+		body         *bodyReservation
+		updatedInput *contextargs.Context
+		// hostErrorsInput keys the host errors cache; updatedInput runs the request.
+		hostErrorsInput    *contextargs.Context
+		hasInteractMarkers bool
+	}
+
+	var workersWg sync.WaitGroup
+	currentWorkers := maxWorkers
+	tasks := make(chan task, maxWorkers)
+	// Workers exit on cancel without draining, and the budget is shared, so
+	// release what they left queued.
+	stopWorkers := func() {
+		close(tasks)
+		workersWg.Wait()
+		for t := range tasks {
+			t.body.done()
+		}
+	}
+	spawnWorker := func(ctx context.Context) {
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			for t := range tasks {
+				if func() (exit bool) {
+					defer t.body.done()
+					select {
+					case <-ctx.Done():
+						return true
+					default:
+					}
+
+					if spmHandler.FoundFirstMatch() || request.skipUnresponsive(t.hostErrorsInput, &skipped) ||
+						spmHandler.Cancelled() {
+						return false
+					}
+					if err := spmHandler.Acquire(); err != nil {
+						return false
+					}
+
+					if spmHandler.FoundFirstMatch() || request.skipUnresponsive(t.hostErrorsInput, &skipped) ||
+						spmHandler.Cancelled() {
+						spmHandler.Release()
+						return false
+					}
+					// Full URL, so https and an explicit port stay on the same key the observation uses.
+					// The handler context ends the wait when stop-at-first-match fires.
+					waitCtx, cancelWait := stopWithHandler(ctx, spmHandler)
+					err := request.rateLimitTake(waitCtx, hostBackoffKey(t.req, t.updatedInput))
+					cancelWait()
+					if err != nil {
+						select {
+						case <-spmHandler.Done():
+							spmHandler.Release()
+							return false
+						case <-ctx.Done():
+							spmHandler.Release()
+							return false
+						case spmHandler.ResultChan <- err:
+							spmHandler.Release()
+							return false
+						}
+					}
+
+					if ctx.Err() != nil || spmHandler.FoundFirstMatch() ||
+						request.skipUnresponsive(t.hostErrorsInput, &skipped) || spmHandler.Cancelled() {
+						spmHandler.Release()
+						return false
+					}
+					// Same default as the sequential loop: a request that has no
+					// annotation timeout still gets the HTTP timeout once it is sent.
+					if t.req.sendTimeout == 0 {
+						t.req.sendTimeout = request.options.Options.GetTimeouts().HttpTimeout
+						t.req.sendTimeoutCause = ErrHttpEngineRequestDeadline
+					}
+					hasInteractMatchers := interactsh.HasMatchers(request.CompiledOperators)
+					needsRequestEvent := hasInteractMatchers && request.NeedsRequestCondition()
+					err = request.executeRequest(t.updatedInput, t.req, make(map[string]interface{}), hasInteractMatchers, func(event *output.InternalWrappedEvent) {
+						if (t.hasInteractMarkers || needsRequestEvent) && request.options.Interactsh != nil {
+							requestData := &interactsh.RequestData{
+								MakeResultFunc: request.MakeResultEvent,
+								Event:          event,
+								Operators:      request.CompiledOperators,
+								MatchFunc:      request.Match,
+								ExtractFunc:    request.Extract,
+							}
+							allOASTUrls := httputils.GetInteractshURLSFromEvent(event.InternalEvent)
+							allOASTUrls = append(allOASTUrls, t.req.interactshURLs...)
+							request.options.RegisterInteractshRequest(sliceutil.Dedupe(allOASTUrls), requestData)
+						}
+						wrappedCallback(event)
+					}, 0)
+					select {
+					case <-spmHandler.Done():
+						spmHandler.Release()
+						return false
+					case spmHandler.ResultChan <- err:
+						// In a block that may send elsewhere, one address going down says
+						// nothing about the others, so only its result is recorded.
+						if request.maySendElsewhere {
+							request.recordHostResult(t.hostErrorsInput, err)
+						} else {
+							request.recordHostResultAndCancelIfUnresponsive(t.hostErrorsInput, err, spmHandler.Cancel)
+						}
+						spmHandler.Release()
+					}
+					return false
+				}() {
+					return
+				}
+			}
+		}()
+	}
+	for i := 0; i < currentWorkers; i++ {
+		spawnWorker(workerCtx)
+	}
+
+	// iterate payloads and make requests
+	generator := request.newGenerator(false)
+	taken := 0
+
+	defer func() { request.countUntaken(generator, taken) }()
+	for {
+		inputData, payloads, ok := generator.nextValue()
+		if !ok {
+			break
+		}
+
+		// A request counts once, here, whether it is then sent, skipped or
+		// fails to build. countUntaken counts the ones the loop never takes.
+		taken++
+
+		request.options.Progress.IncrementRequests()
+
+		select {
+		case <-input.Context().Done():
+			stopWorkers()
+			return input.Context().Err()
+		default:
+		}
+
+		// resize check point - nop if there are no changes
+		if shouldFollowGlobal && spmHandler.Size() != request.options.Options.PayloadConcurrency {
+			if err := spmHandler.Resize(input.Context(), request.options.Options.PayloadConcurrency); err != nil {
+				stopWorkers()
+				return err
+			}
+			// if payload concurrency increased, add more workers
+			if spmHandler.Size() > currentWorkers {
+				for i := 0; i < spmHandler.Size()-currentWorkers; i++ {
+					spawnWorker(workerCtx)
+				}
+				currentWorkers = spmHandler.Size()
+			}
+		}
+
+		// break if stop at first match is found
+		if spmHandler.FoundFirstMatch() {
+			break
+		}
+
+		// Queued tasks hold budget and are only released once the workers
+		// stop, so the wait has to end with them.
+		generatedHttpRequest, reservation, err := request.makeReserved(workerCtx, generator, input, inputData, payloads, dynamicValues)
+		if err != nil {
+			if workerCtx.Err() != nil {
+				stopWorkers()
+				if spmHandler.FoundFirstMatch() {
+					return nil
+				}
+				return context.Cause(workerCtx)
+			}
+			stopWorkers()
+			return err
+		}
+		hasInteractMarkers := interactsh.HasMarkers(inputData) || len(generatedHttpRequest.interactshURLs) > 0
+		if input.MetaInput.Input == "" {
+			input.MetaInput.Input = generatedHttpRequest.URL()
+		}
+		updatedInput := contextargs.GetCopyIfHostOutdated(input, generatedHttpRequest.URL())
+
+		hostErrorsInput := contextargs.GetCopyIfAddressOutdated(input, generatedHttpRequest.URL())
+		if request.skipUnresponsive(hostErrorsInput, &skipped) {
+			reservation.done()
+			// Every request of the block goes to this address, so none can be sent.
+			if !request.maySendElsewhere {
+				break
+			}
+			// The next request may go to another address.
+			continue
+		}
+		select {
+		case <-spmHandler.Done():
+			reservation.done()
+			stopWorkers()
+			spmHandler.Wait()
+			if spmHandler.FoundFirstMatch() {
+				return nil
+			}
+
+			return requestsError(spmHandler.CombinedResults(), skipped.Load())
+		case <-workerCtx.Done():
+			reservation.done()
+			stopWorkers()
+			if spmHandler.FoundFirstMatch() {
+				return nil
+			}
+			return context.Cause(workerCtx)
+		case tasks <- task{
+			req:                generatedHttpRequest,
+			body:               reservation,
+			updatedInput:       updatedInput,
+			hostErrorsInput:    hostErrorsInput,
+			hasInteractMarkers: hasInteractMarkers,
+		}:
+		}
+	}
+	stopWorkers()
+	spmHandler.Wait()
+	if spmHandler.FoundFirstMatch() {
+		// ignore any context cancellation and in-transit execution errors
+		return nil
+	}
+
+	return requestsError(spmHandler.CombinedResults(), skipped.Load())
+}
+
+// executeTurboHTTP executes turbo http request for a URL
+func (request *Request) executeTurboHTTP(input *contextargs.Context, dynamicValues, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
+	generator := request.newGenerator(false)
+	taken := 0
+
+	defer func() { request.countUntaken(generator, taken) }()
+
+	// An input that does not parse fails the block before any request is built.
+	_, err := urlutil.Parse(input.MetaInput.Input)
+	if err != nil {
+		return err
+	}
+
+	pipeOptions := rawhttp.DefaultPipelineOptions
+	pipeOptions.MaxConnections = 1
+	// route pipelined connections through the fastdialer so the network policy
+	// applies; without an explicit Dialer the pipeline client uses a raw dial.
+	if dialers := protocolstate.GetDialersWithId(request.options.Options.ExecutionId); dialers != nil && dialers.Fastdialer != nil {
+		fd := dialers.Fastdialer
+		pipeOptions.Dialer = func(addr string) (net.Conn, error) {
+			// the input context carries the pinned ip of the target, if any
+			return fd.Dial(input.Context(), "tcp", addr)
+		}
+	}
+	if request.PipelineConcurrentConnections > 0 {
+		pipeOptions.MaxConnections = request.PipelineConcurrentConnections
+	}
+	if request.PipelineRequestsPerConnection > 0 {
+		pipeOptions.MaxPendingRequests = request.PipelineRequestsPerConnection
+	}
+	// A pipeline client dials one address, so each address a request goes to
+	// gets its own, with the same limits. Only this loop reads the map.
+	pipeClients := make(map[string]*rawhttp.PipelineClient)
+	pipeClientFor := func(requestURL string) *rawhttp.PipelineClient {
+		address := pipelineAddress(requestURL)
+
+		client, ok := pipeClients[address]
+		if !ok {
+			options := pipeOptions
+			options.Host = address
+			client = rawhttp.NewPipelineClient(options)
+			pipeClients[address] = client
+		}
+
+		return client
+	}
+
+	// defaultMaxWorkers should be a sufficient value to keep queues always full
+	// in case the queue is bigger increase the workers
+	maxWorkers := max(pipeOptions.MaxPendingRequests, defaultMaxWorkers)
+
+	// Stop-at-first-match logic while executing requests
+	// parallelly using threads
+	shouldStop := (request.options.Options.StopAtFirstMatch || request.StopAtFirstMatch || request.options.StopAtFirstMatch)
+
+	ctx, cancel := context.WithCancel(input.Context())
+	defer cancel()
+
+	spmHandler := httputils.NewBlockingSPMHandler[error](ctx, maxWorkers, maxErrorsWhenParallel, shouldStop)
+	defer spmHandler.Cancel()
+
+	// skipped notes that a request was not sent because its address is unresponsive.
+	var skipped atomic.Bool
+
+	// wrappedCallback is a callback that wraps the original callback
+	// to implement stop at first match logic
+	wrappedCallback := func(event *output.InternalWrappedEvent) {
+		if !event.HasOperatorResult() {
+			callback(event) // not required but we can allow it
+			return
+		}
+		// this will execute match condition such that if stop at first match is enabled
+		// this will be only executed once
+		spmHandler.MatchCallback(func() {
+			callback(event)
+		})
+		if shouldStop {
+			// stop all running requests and exit
+			spmHandler.Trigger()
+		}
+	}
+
+	for {
+		inputData, payloads, ok := generator.nextValue()
+		if !ok {
+			break
+		}
+
+		// A request counts once, here, whether it is then sent, skipped or
+		// fails to build. countUntaken counts the ones the loop never takes.
+		taken++
+
+		request.options.Progress.IncrementRequests()
+
+		select {
+		case <-input.Context().Done():
+			// The pipeline client takes no context, so a request already sent
+			// still delivers its result. Wait for it, as executeParallelHTTP
+			// does, so none reaches the callback after this returns.
+			spmHandler.Wait()
+
+			return input.Context().Err()
+		default:
+		}
+
+		// In a block that may send elsewhere, a down target says nothing about
+		// the addresses of its requests, which are checked one by one below.
+		if spmHandler.FoundFirstMatch() || (!request.maySendElsewhere && request.skipUnresponsive(input, &skipped)) ||
+			spmHandler.Cancelled() {
+			// skip if first match is found
+			break
+		}
+
+		// The handler's context ends the wait for budget at the first match, and
+		// with the input's cancel, as executeParallelHTTP's workerCtx does.
+		ctx := spmHandler.Context()
+		generatedHttpRequest, reservation, err := request.makeReserved(ctx, generator, input, inputData, payloads, dynamicValues)
+		if err != nil {
+			// A first match cancels the handler and ends the wait, and so does a
+			// result that finds the address down, in a block that cannot send
+			// elsewhere. The block then ends as at the check above, noting the
+			// skip when the address is down. The handler's context derives from
+			// the input's, so an input cancel has to be told apart first: it
+			// stays an error.
+			if input.Context().Err() == nil && spmHandler.Cancelled() {
+				request.skipUnresponsive(input, &skipped)
+
+				break
+			}
+
+			// The requests already started deliver their results first, as in executeParallelHTTP.
+			spmHandler.Wait()
+
+			return err
+		}
+		if input.MetaInput.Input == "" {
+			input.MetaInput.Input = generatedHttpRequest.URL()
+		}
+		updatedInput := contextargs.GetCopyIfHostOutdated(input, generatedHttpRequest.URL())
+
+		hostErrorsInput := contextargs.GetCopyIfAddressOutdated(input, generatedHttpRequest.URL())
+		if request.skipUnresponsive(hostErrorsInput, &skipped) {
+			reservation.done()
+			// Every request of the block goes to this address, so none can be sent.
+			if !request.maySendElsewhere {
+				break
+			}
+			// The next request may go to another address.
+			continue
+		}
+
+		generatedHttpRequest.pipelinedClient = pipeClientFor(generatedHttpRequest.URL())
+		if err := spmHandler.Acquire(); err != nil {
+			reservation.done()
+			break
+		}
+
+		go func(httpRequest *generatedRequest, body *bodyReservation, requestInput, hostErrorsInput *contextargs.Context) {
+			defer spmHandler.Release()
+			defer body.done()
+
+			if spmHandler.FoundFirstMatch() || request.skipUnresponsive(hostErrorsInput, &skipped) {
+				// skip if first match is found
+				return
+			}
+			waitCtx, cancelWait := stopWithHandler(requestInput.Context(), spmHandler)
+			err := request.waitHostBackoff(waitCtx, hostBackoffKey(httpRequest, requestInput))
+			cancelWait()
+			if err != nil || spmHandler.FoundFirstMatch() || spmHandler.Cancelled() {
+				if err != nil {
+					select {
+					case <-spmHandler.Done():
+					case spmHandler.ResultChan <- err:
+					}
+				}
+				return
+			}
+			err = request.executeRequest(requestInput, httpRequest, previous, false, wrappedCallback, 0)
+			select {
+			case <-spmHandler.Done():
+				return
+			case spmHandler.ResultChan <- err:
+				// In a block that may send elsewhere, one address going down
+				// says nothing about the others, so only its result is recorded.
+				if request.maySendElsewhere {
+					request.recordHostResult(hostErrorsInput, err)
+				} else {
+					request.recordHostResultAndCancelIfUnresponsive(hostErrorsInput, err, spmHandler.Cancel)
+				}
+				return
+			}
+		}(generatedHttpRequest, reservation, updatedInput, hostErrorsInput)
+	}
+	spmHandler.Wait()
+	if spmHandler.FoundFirstMatch() {
+		// ignore any context cancellation and in-transit execution errors
+		return nil
+	}
+
+	return requestsError(spmHandler.CombinedResults(), skipped.Load())
+}
+
+// pipelineAddress returns the host and port that a request to requestURL goes
+// to, with the default port of its scheme when it names none. A pipeline client
+// with a custom dialer gets no default port from rawhttp.
+func pipelineAddress(requestURL string) string {
+	// ParseURL reads a host with a single label, such as http://intranet, as a path.
+	parsed, err := urlutil.ParseAbsoluteURL(requestURL, true)
+	if err != nil {
+		return ""
+	}
+
+	port := parsed.Port()
+	if port == "" {
+		port = "80"
+		if parsed.Scheme == urlutil.HTTPS {
+			port = "443"
+		}
+	}
+
+	return net.JoinHostPort(parsed.Hostname(), port)
+}
+
+// countUntaken counts the requests of generator that the loop never took, so a
+// block that stops, skips or fails to build still ends at its total (#7838).
+// Remaining() can't stand in: it leaves out @once requests, and with payloads it
+// counts an extra pass before the first take and after the generator runs out.
+func (request *Request) countUntaken(generator *requestGenerator, taken int) {
+	if untaken := generator.Total() - taken; untaken > 0 {
+		request.options.Progress.SetRequests(uint64(untaken))
+	}
+}
+
+// ExecuteWithResults executes the final request on a URL
+func (request *Request) ExecuteWithResults(input *contextargs.Context, dynamicValues, previous output.InternalEvent, callback protocols.OutputEventCallback) error {
+	// verify if pipeline was requested
+	if request.Pipeline {
+		return request.executeTurboHTTP(input, dynamicValues, previous, callback)
+	}
+	// verify if a basic race condition was requested
+	if request.sendsRaceCopies() {
+		return request.executeRaceRequest(input, dynamicValues, previous, callback)
+	}
+
+	// verify if fuzz elaboration was requested
+	if len(request.Fuzzing) > 0 {
+		return request.executeFuzzingRule(input, dynamicValues, callback)
+	}
+
+	// verify if parallel elaboration was requested
+	if request.Threads > 0 && (len(request.Payloads) > 0 || request.Race) {
+		return request.executeParallelHTTP(input, dynamicValues, callback)
+	}
+
+	generator := request.newGenerator(false)
+
+	initialContext := dynamicValueContext{
+		values:   generators.CopyMap(dynamicValues),
+		previous: cloneInternalEvent(previous),
+	}
+	dynamicValueContexts := []dynamicValueContext{initialContext}
+	if request.IterateAll {
+		dynamicValueContexts = expandDynamicValueContexts(initialContext, generators.MergeMapsMany(dynamicValues), true)
+	}
+	var requestErr error
+
+	var skipped bool
+	// skipRequest counts a request the execution does not send because its address is unresponsive.
+	skipRequest := func() {
+		skipped = true
+
+		request.options.Progress.IncrementRequests()
+	}
+
+executionLoop:
+	for {
+		executeFunc := func(data string, payloads, dynamicValue map[string]interface{}, previousEvent output.InternalEvent) (skipBranch, stop bool, extracted map[string][]string, err error) {
+			hasInteractMatchers := interactsh.HasMatchers(request.CompiledOperators)
+
+			// A stop or an error ends the execution, and the requests it leaves
+			// unsent count as processed. This request counts once too: below once it
+			// is sent, fails or is skipped, or here when the execution ends before that.
+			processed := false
+
+			defer func() {
+				if !stop && err == nil {
+					return
+				}
+
+				unsent := generator.Remaining()
+				if !processed {
+					unsent++
+				}
+
+				if unsent > 0 {
+					request.options.Progress.SetRequests(uint64(unsent))
+				}
+			}()
+
+			ctx := input.Context()
+			generatedHttpRequest, reservation, err := request.makeReserved(ctx, generator, input, data, payloads, dynamicValue)
+			if err != nil {
+				return false, true, nil, err
+			}
+			defer reservation.done()
+
+			if generatedHttpRequest.sendTimeout == 0 {
+				generatedHttpRequest.sendTimeout = request.options.Options.GetTimeouts().HttpTimeout
+				generatedHttpRequest.sendTimeoutCause = ErrHttpEngineRequestDeadline
+			}
+			// ideally if http template used a custom port or hostname
+			// we would want to update it in input but currently templateCtx logic
+			// is closely tied to contextargs.Context so we are temporarily creating
+			// a copy and using it to check for host errors etc
+			// but this should be replaced once templateCtx is refactored properly
+			hostErrorsInput := contextargs.GetCopyIfAddressOutdated(input, generatedHttpRequest.URL())
+
+			// A request that is not sent takes no rate-limit token, which every template shares.
+			if request.maySendElsewhere && request.isUnresponsiveAddress(hostErrorsInput) {
+				skipRequest()
+
+				return false, false, nil, nil
+			}
+
+			// Full URL, so https and an explicit port stay on the same key the observation uses.
+			if err := request.rateLimitTake(ctx, hostBackoffKey(generatedHttpRequest, input)); err != nil {
+				return false, true, nil, err
+			}
+
+			hasInteractMarkers := interactsh.HasMarkers(data) || len(generatedHttpRequest.interactshURLs) > 0
+			if input.MetaInput.Input == "" {
+				input.MetaInput.Input = generatedHttpRequest.URL()
+			}
+			var gotMatches bool
+			var extractedDynamicValues map[string][]string
+			execReqErr := request.executeRequest(input, generatedHttpRequest, previousEvent, hasInteractMatchers, func(event *output.InternalWrappedEvent) {
+				// a special case where operators has interactsh matchers and multiple request are made
+				// ex: status_code_2 , interactsh_protocol (from 1st request) etc
+				needsRequestEvent := interactsh.HasMatchers(request.CompiledOperators) && request.NeedsRequestCondition()
+				if (hasInteractMarkers || needsRequestEvent) && request.options.Interactsh != nil {
+					requestData := &interactsh.RequestData{
+						MakeResultFunc: request.MakeResultEvent,
+						Event:          event,
+						Operators:      request.CompiledOperators,
+						MatchFunc:      request.Match,
+						ExtractFunc:    request.Extract,
+					}
+					allOASTUrls := httputils.GetInteractshURLSFromEvent(event.InternalEvent)
+					allOASTUrls = append(allOASTUrls, generatedHttpRequest.interactshURLs...)
+					request.options.RegisterInteractshRequest(sliceutil.Dedupe(allOASTUrls), requestData)
+					gotMatches = request.options.Interactsh.AlreadyMatched(requestData)
+				}
+				// Add the extracts to the dynamic values if any.
+				if event.OperatorsResult != nil {
+					gotMatches = event.OperatorsResult.Matched
+					extractedDynamicValues = generators.MergeMapsMany(
+						request.extractCurrentDynamicValues(event, generator.currentIndex),
+						extractedDynamicValues,
+					)
+				}
+				// Note: This is a race condition prone zone i.e when request has interactsh_matchers
+				// Interactsh.RequestEvent tries to access/update output.InternalWrappedEvent depending on logic
+				// to avoid conflicts with `callback` mutex is used here and in Interactsh.RequestEvent
+				// Note: this only happens if requests > 1 and interactsh matcher is used
+				// TODO: interactsh logic in nuclei needs to be refactored to avoid such situations
+				callback(event)
+			}, generator.currentIndex)
+
+			// A variable may be unresolved for one iterate-all branch while sibling
+			// branches remain executable.
+			if errors.Is(execReqErr, ErrMissingVars) {
+				return true, false, nil, nil
+			}
+			// executeRequest sent nothing, so there is no host result to record
+			// and no failure to count.
+			if errors.Is(execReqErr, hosterrorscache.ErrUnresponsiveHost) {
+				// Every request of the block goes to this address, so none can be sent.
+				if !request.maySendElsewhere {
+					return false, true, nil, execReqErr
+				}
+				// Another template can mark the address after the check above.
+				skipRequest()
+
+				return false, false, nil, nil
+			}
+
+			request.recordHostResult(hostErrorsInput, execReqErr)
+			if execReqErr != nil {
+				reqKitErr := errkit.FromError(execReqErr)
+				reqKitErr.Msgf("got err while executing %v", generatedHttpRequest.URL())
+
+				requestErr = reqKitErr
+			}
+			// executeRequest counts the error of a failed request.
+			request.options.Progress.IncrementRequests()
+
+			processed = true
+
+			// If this was a match, and we want to stop at first match, skip all further requests.
+			shouldStopAtFirstMatch := generatedHttpRequest.original.options.Options.StopAtFirstMatch || generatedHttpRequest.original.options.StopAtFirstMatch || request.StopAtFirstMatch
+			if shouldStopAtFirstMatch && gotMatches {
+				return false, true, nil, nil
+			}
+			return false, false, extractedDynamicValues, nil
+		}
+
+		inputData, payloads, ok := generator.nextValue()
+		if !ok {
+			break
+		}
+
+		select {
+		case <-input.Context().Done():
+			return input.Context().Err()
+		default:
+		}
+
+		isOnceRequest := generator.hasMarker(inputData, Once)
+
+		if isOnceRequest {
+			var onceExtracted map[string][]string
+			var oncePreviousDelta output.InternalEvent
+			executed := false
+			for _, branch := range dynamicValueContexts {
+				select {
+				case <-input.Context().Done():
+					return input.Context().Err()
+				default:
+				}
+
+				before := cloneInternalEvent(branch.previous)
+				after := cloneInternalEvent(branch.previous)
+				skipBranch, stop, extracted, gotErr := executeFunc(inputData, generators.CopyMap(payloads), branch.values, after)
+				if gotErr != nil {
+					if requestErr == nil {
+						requestErr = gotErr
+					}
+					break executionLoop
+				}
+				if stop {
+					break executionLoop
+				}
+				if skipBranch {
+					continue
+				}
+				executed = true
+				onceExtracted = extracted
+				oncePreviousDelta = changedEventValues(before, after)
+				break
+			}
+			if !executed {
+				dynamicValueContexts = nil
+				continue
+			}
+
+			nextDynamicValueContexts := make([]dynamicValueContext, 0, len(dynamicValueContexts))
+			for _, branch := range dynamicValueContexts {
+				maps.Copy(branch.previous, oncePreviousDelta)
+				nextDynamicValueContexts = append(nextDynamicValueContexts, expandDynamicValueContexts(branch, onceExtracted, request.IterateAll)...)
+			}
+			dynamicValueContexts = nextDynamicValueContexts
+			continue
+		}
+
+		nextDynamicValueContexts := make([]dynamicValueContext, 0, len(dynamicValueContexts))
+		for _, branch := range dynamicValueContexts {
+			select {
+			case <-input.Context().Done():
+				return input.Context().Err()
+			default:
+			}
+
+			skipBranch, stop, extractedDynamicValues, gotErr := executeFunc(inputData, generators.CopyMap(payloads), branch.values, branch.previous)
+			if gotErr != nil {
+				if requestErr == nil {
+					requestErr = gotErr
+				}
+				break executionLoop
+			}
+			if stop {
+				break executionLoop
+			}
+			if skipBranch {
+				continue
+			}
+			nextDynamicValueContexts = append(nextDynamicValueContexts, expandDynamicValueContexts(branch, extractedDynamicValues, request.IterateAll)...)
+		}
+		dynamicValueContexts = nextDynamicValueContexts
+	}
+	// A request error takes precedence over a skip, as in requestsError.
+	if requestErr == nil && skipped {
+		return hosterrorscache.ErrUnresponsiveHost
+	}
+
+	return requestErr
+}
+
+type dynamicValueContext struct {
+	values   map[string]interface{}
+	seen     map[string]map[string]struct{}
+	previous output.InternalEvent
+}
+
+func expandDynamicValueContexts(parent dynamicValueContext, extracted map[string][]string, iterateAll bool) []dynamicValueContext {
+	if len(extracted) == 0 {
+		return []dynamicValueContext{parent}
+	}
+
+	nextValues := make(map[string][]string, len(extracted))
+	for key, values := range extracted {
+		values = sliceutil.Dedupe(values)
+		if len(values) == 0 {
+			continue
+		}
+
+		seen := parent.seen[key]
+		if len(seen) == 0 {
+			nextValues[key] = values
+			continue
+		}
+
+		current := types.ToString(parent.values[key])
+		for _, value := range values {
+			if value == current {
+				nextValues[key] = append(nextValues[key], value)
+				break
+			}
+		}
+		for _, value := range values {
+			if _, exists := seen[value]; !exists {
+				nextValues[key] = append(nextValues[key], value)
+			}
+		}
+		if len(nextValues[key]) == 0 {
+			nextValues[key] = values
+		}
+	}
+	if len(nextValues) == 0 {
+		return []dynamicValueContext{parent}
+	}
+
+	seen := cloneSeenValues(parent.seen)
+	for key, extractedValues := range extracted {
+		if seen[key] == nil {
+			seen[key] = make(map[string]struct{}, len(extractedValues))
+		}
+		for _, value := range extractedValues {
+			seen[key][value] = struct{}{}
+		}
+	}
+
+	var contexts []dynamicValueContext
+	operators.MakeDynamicValuesCallback(nextValues, iterateAll, func(values map[string]interface{}) bool {
+		contexts = append(contexts, dynamicValueContext{
+			values:   generators.MergeMaps(parent.values, values),
+			seen:     seen,
+			previous: cloneInternalEvent(parent.previous),
+		})
+		return false
+	})
+	return contexts
+}
+
+func cloneSeenValues(source map[string]map[string]struct{}) map[string]map[string]struct{} {
+	cloned := make(map[string]map[string]struct{}, len(source))
+	for key, values := range source {
+		cloned[key] = maps.Clone(values)
+	}
+	return cloned
+}
+
+func cloneInternalEvent(source output.InternalEvent) output.InternalEvent {
+	cloned := make(output.InternalEvent, len(source))
+	maps.Copy(cloned, source)
+	return cloned
+}
+
+func changedEventValues(before, after output.InternalEvent) output.InternalEvent {
+	changed := make(output.InternalEvent)
+	for key, value := range after {
+		if previousValue, ok := before[key]; !ok || !reflect.DeepEqual(previousValue, value) {
+			changed[key] = value
+		}
+	}
+	return changed
+}
+
+func (request *Request) extractCurrentDynamicValues(event *output.InternalWrappedEvent, requestIndex int) map[string][]string {
+	if request.CompiledOperators == nil {
+		return nil
+	}
+
+	values := make(map[string][]string)
+	for _, extractor := range request.CompiledOperators.Extractors {
+		if !extractor.Internal || extractor.Name == "" || !extractorAppliesToRequest(extractor.Part, requestIndex) {
+			continue
+		}
+		if extractor.GetType() == extractors.LLMExtractor {
+			if event.OperatorsResult != nil {
+				values[extractor.Name] = append(values[extractor.Name], event.OperatorsResult.DynamicValues[extractor.Name]...)
+			}
+			if len(values[extractor.Name]) == 0 {
+				switch extracted := event.InternalEvent[extractor.Name].(type) {
+				case []string:
+					values[extractor.Name] = append(values[extractor.Name], extracted...)
+				case string:
+					values[extractor.Name] = append(values[extractor.Name], extracted)
+				}
+			}
+			continue
+		}
+		for value := range request.Extract(event.InternalEvent, extractor) {
+			values[extractor.Name] = append(values[extractor.Name], value)
+		}
+	}
+	for key, extracted := range values {
+		values[key] = sliceutil.Dedupe(extracted)
+	}
+	return values
+}
+
+func extractorAppliesToRequest(part string, requestIndex int) bool {
+	separator := strings.LastIndexByte(part, '_')
+	if separator < 0 || separator == len(part)-1 {
+		return true
+	}
+	index, err := strconv.Atoi(part[separator+1:])
+	return err != nil || index == requestIndex
+}
+
+const drainReqSize = int64(8 * unitutils.Kilo)
+
+// httpToHTTPSMismatchSignature is the response text servers such as nginx/openresty
+// emit when a plaintext HTTP request lands on a TLS-only (https) port.
+const httpToHTTPSMismatchSignature = "The plain HTTP request was sent to HTTPS port"
+
+// looksLikeHTTPToHTTPSMismatch reports whether resp is the specific "plain HTTP
+// request sent to an HTTPS-only port" error page. It peeks a bounded prefix of
+// the body to check, and - when the signature does not match - restores that
+// prefix onto resp.Body so downstream readers (matchers, dumps, project cache)
+// still see the complete, untouched response.
+func looksLikeHTTPToHTTPSMismatch(resp *http.Response) bool {
+	if resp == nil || resp.StatusCode != 400 || resp.Body == nil {
+		return false
+	}
+	peeked, _ := io.ReadAll(io.LimitReader(resp.Body, drainReqSize))
+	if bytes.Contains(peeked, []byte(httpToHTTPSMismatchSignature)) {
+		return true
+	}
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(peeked), resp.Body), resp.Body}
+	return false
+}
+
+// reuseRequestBody reads the body once and installs GetBody copies. The
+// post-send dump reads one while the transport may still be writing another.
+// GET, HEAD, and chunked requests keep their existing content length.
+func reuseRequestBody(req *retryablehttp.Request) error {
+	// Bodies set through httpbody already hand out independent copies.
+	if _, ok := req.Body.(*httpbody.Body); ok {
+		return nil
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return err
+	}
+	keepLength := stringsutil.EqualFoldAny(req.Method, http.MethodGet, http.MethodHead) || req.Header.Get("Transfer-Encoding") == "chunked"
+	contentLength := req.ContentLength
+	httpbody.Set(req, body)
+	if keepLength {
+		req.ContentLength = contentLength
+	}
+	return nil
+}
+
+// rewindRequestBody installs a fresh body for a follow-up send. The first
+// attempt has already read the original reader to EOF.
+func rewindRequestBody(req *retryablehttp.Request) {
+	if req == nil || req.GetBody == nil {
+		return
+	}
+	body, err := req.GetBody()
+	if err != nil {
+		return
+	}
+	req.Body = body
+}
+
+// executeRequest executes the actual generated request and returns error if occurred.
+// It counts one progress error for each error it returns, except
+// ErrUnresponsiveHost and ErrMissingVars, so its callers count only the request.
+func (request *Request) executeRequest(input *contextargs.Context, generatedRequest *generatedRequest, previousEvent output.InternalEvent, hasInteractMatchers bool, processEvent protocols.OutputEventCallback, requestCount int) (err error) {
+	// Check if hosts keep erroring
+	if request.isUnresponsiveAddress(contextargs.GetCopyIfAddressOutdated(input, generatedRequest.URL())) {
+		return hosterrorscache.ErrUnresponsiveHost
+	}
+
+	// A request that fails from here on counts as one error, so its caller
+	// counts the request only. A variable left unresolved skips the request
+	// instead.
+	defer func() {
+		if err != nil && !errors.Is(err, ErrMissingVars) {
+			request.options.Progress.IncrementErrorsBy(1)
+		}
+	}()
+
+	// Race requests must all be in flight together to reach the open gate.
+	if !generatedRequest.original.Race && !generatedRequest.bodyReserved {
+		releaseBody, err := request.options.RequestBodyBudget.Acquire(input.Context(), generatedRequest.bodyLen())
+		if err != nil {
+			return err
+		}
+		defer releaseBody()
+	}
+	if generatedRequest.sendTimeout > 0 && generatedRequest.request != nil {
+		ctx, cancel := context.WithTimeoutCause(
+			generatedRequest.request.Context(), generatedRequest.sendTimeout, generatedRequest.sendTimeoutCause)
+		defer cancel()
+		generatedRequest.request = generatedRequest.request.WithContext(ctx)
+	}
+
+	// wrap one more callback for validation and fixing event
+	callback := func(event *output.InternalWrappedEvent) {
+		// validateNFixEvent performs necessary validation on generated event
+		// and attempts to fix it , this includes things like making sure
+		// `template-id` is set , `request-url-pattern` is set etc
+		request.validateNFixEvent(input, generatedRequest, err, event)
+		processEvent(event)
+	}
+
+	// Captured before auth, scheme correction, or the error path can rewrite
+	// the URL. The caller waited on this same key.
+	backoffKey := hostBackoffKey(generatedRequest, input)
+
+	request.setCustomHeaders(generatedRequest)
+	fuzzed := &generatedRequest.fuzzGeneratedRequest
+	cookieFuzzing := generatedRequest.request != nil && fuzzed.Component != nil && fuzzed.Component.Name() == component.RequestCookieComponent && len(fuzzed.FuzzedKeys) > 0
+
+	var (
+		resp            *http.Response
+		fromCache       bool
+		dumpedRequest   requestDump
+		projectCacheKey []byte
+		// executingClient preserves the request's cookie jar, fuzz protection,
+		// and timeout for network execution and analyzer follow-up requests,
+		// including follow-ups when the initial response came from the cache.
+		executingClient *retryablehttp.Client
+	)
+
+	// Dump request for variables checks
+	// For race conditions we can't dump the request body at this point as it's already waiting the open-gate event, already handled with a similar code within the race function
+	if !generatedRequest.original.Race {
+
+		// Buffer every body so the post-send dump reads its own copy. GET, HEAD,
+		// and chunked requests keep the content length they already had.
+		if generatedRequest.request != nil && generatedRequest.request.Body != nil {
+			if err = reuseRequestBody(generatedRequest.request); err != nil {
+				// log error and continue
+				gologger.Verbose().Msgf("[%v] Could not read request body while forcing transfer encoding: %s\n", request.options.TemplateID, err)
+				err = nil
+			}
+		}
+
+		// do the same for unsafe requests
+		if generatedRequest.rawRequest != nil && !stringsutil.EqualFoldAny(generatedRequest.rawRequest.Method, http.MethodGet, http.MethodHead) && generatedRequest.rawRequest.Data != "" && generatedRequest.rawRequest.Headers["Transfer-Encoding"] != "chunked" {
+			generatedRequest.rawRequest.Headers["Content-Length"] = strconv.Itoa(len(generatedRequest.rawRequest.Data))
+		}
+
+		var dumpError error
+		// TODO: dump is currently not working with post-processors - somehow it alters the signature
+		dumpedRequest, dumpError = dump(generatedRequest, input.MetaInput.Input, request.options.Options.RequestSaveSize)
+		if dumpError != nil {
+			return dumpError
+		}
+		if request.options.ProjectFile != nil {
+			var scheme, host string
+			if generatedRequest.request != nil && generatedRequest.request.Request != nil && generatedRequest.request.Request.URL != nil {
+				scheme, host = generatedRequest.request.Scheme, generatedRequest.request.Request.URL.Host
+			}
+			projectCacheKey = getHTTPProjectCacheScope(dumpedRequest, generatedRequest.body(), scheme, host)
+			if maxBodylimit := request.getEffectiveReadLimit(); maxBodylimit > 0 {
+				projectCacheKey = append(projectCacheKey, []byte(fmt.Sprintf(":limit:%d", maxBodylimit))...)
+			}
+			// A raw-reading request stores the encoded bytes. A plain request
+			// stores the decoded body. They must not share a cache entry.
+			if request.keepsRawResponse() {
+				projectCacheKey = append(projectCacheKey, ":raw"...)
+			}
+		}
+
+		// A truncated dump leaves part of the body out, so check the rest
+		// of the body too. Each part is checked on its own since the
+		// checks stop at the first item without variables.
+		checked := []string{convUtil.String(dumpedRequest.data)}
+		if dumpedRequest.truncated > 0 {
+			if body := convUtil.String(generatedRequest.body()); strings.Contains(body, "{{") {
+				checked = append(checked, body)
+			}
+		}
+		for _, item := range checked {
+			var varErr error
+			if ignoreList := GetVariablesNamesSkipList(generatedRequest.original.Signature.Value); ignoreList != nil {
+				varErr = expressions.ContainsVariablesWithIgnoreList(ignoreList, item)
+			} else { // Check if are there any unresolved variables. If yes, skip unless overridden by user.
+				varErr = expressions.ContainsUnresolvedVariables(item)
+			}
+			if varErr != nil && !request.SkipVariablesCheck {
+				gologger.Warning().Msgf("[%s] Could not make http request for %s: %v\n", request.options.TemplateID, input.MetaInput.Input, varErr)
+				return ErrMissingVars
+			}
+		}
+	}
+
+	// === apply auth strategies ===
+	if generatedRequest.request != nil && !request.SkipSecretFile {
+		if request.options.AuthProvider != nil && cookieFuzzing {
+			removeFuzzedCookieFields(generatedRequest.request.Request, fuzzed.FuzzedKeys)
+		}
+		generatedRequest.ApplyAuth(request.options.AuthProvider)
+	}
+	if cookieFuzzing {
+		restoreFuzzedCookieFields(generatedRequest.request.Request, fuzzed.FuzzedKeys)
+	}
+
+	var formedURL string
+	var hostname string
+	var sent bool
+	timeStart := time.Now()
+	if generatedRequest.original.Pipeline {
+		// if request is a pipeline request, use the pipelined client
+		if generatedRequest.rawRequest != nil {
+			formedURL = generatedRequest.rawRequest.FullURL
+			if parsed, parseErr := urlutil.ParseURL(formedURL, true); parseErr == nil {
+				hostname = parsed.Host
+			}
+			// The request's own URL picks the scheme, as it does the address of its
+			// client. The input can leave the scheme out of a host that @Host names
+			// with one.
+			rawURL := input.MetaInput.Input
+			if formedURL != "" {
+				rawURL = formedURL
+			}
+
+			resp, err = generatedRequest.pipelinedClient.DoRaw(
+				generatedRequest.rawRequest.Method, rawURL, generatedRequest.rawRequest.Path,
+				generators.ExpandMapValues(generatedRequest.rawRequest.Headers),
+				io.NopCloser(strings.NewReader(generatedRequest.rawRequest.Data)))
+			sent = true
+		} else if generatedRequest.request != nil {
+			if generatedRequest.request.URL != nil {
+				hostname = generatedRequest.request.URL.Host
+			}
+			resp, err = generatedRequest.pipelinedClient.Dor(generatedRequest.request)
+			sent = true
+		}
+	} else if generatedRequest.original.Unsafe && generatedRequest.rawRequest != nil {
+		// if request is a unsafe request, use the rawhttp client
+		formedURL = generatedRequest.rawRequest.FullURL
+		// use request url as matched url if empty
+		if formedURL == "" {
+			urlx, err := urlutil.Parse(input.MetaInput.Input)
+			if err != nil {
+				formedURL = fmt.Sprintf("%s%s", input.MetaInput.Input, generatedRequest.rawRequest.Path)
+			} else {
+				_ = urlx.MergePath(generatedRequest.rawRequest.Path, true)
+				formedURL = urlx.String()
+			}
+		}
+		if parsed, parseErr := urlutil.ParseURL(formedURL, true); parseErr == nil {
+			hostname = parsed.Host
+		}
+		options := *generatedRequest.original.rawhttpClient.Options
+		options.FollowRedirects = request.Redirects
+		options.CustomRawBytes = generatedRequest.rawRequest.UnsafeRawBytes
+		options.ForceReadAllBody = request.ForceReadAllBody
+		options.SNI = request.options.Options.SNI
+		inputUrl := input.MetaInput.Input
+		if generatedRequest.rawRequest.FullURL != "" {
+			inputUrl = generatedRequest.rawRequest.FullURL
+		}
+		if url, err := urlutil.ParseURL(inputUrl, false); err == nil {
+			url.Path = ""
+			url.Params = urlutil.NewOrderedParams() // donot include query params
+			// inputUrl should only contain scheme://host:port
+			inputUrl = url.String()
+		}
+		formedURL = fmt.Sprintf("%s%s", inputUrl, generatedRequest.rawRequest.Path)
+
+		// send rawhttp request and get response
+		resp, err = httpclientpool.SendRawRequest(generatedRequest.original.rawhttpClient, &httpclientpool.RawHttpRequestOpts{
+			Method:  generatedRequest.rawRequest.Method,
+			URL:     inputUrl,
+			Path:    generatedRequest.rawRequest.Path,
+			Headers: generators.ExpandMapValues(generatedRequest.rawRequest.Headers),
+			Body:    io.NopCloser(strings.NewReader(generatedRequest.rawRequest.Data)),
+			Options: &options,
+		})
+		sent = true
+	} else {
+		//** For Normal requests **//
+		// Use the dial target (URL.Host) rather than the optional Host-header
+		// override (request.Host), so the per-host pool keys distinct
+		// connection targets even when templates set a custom Host header
+		// against multiple IPs/vhosts.
+		if generatedRequest.request.URL != nil {
+			hostname = generatedRequest.request.URL.Host
+		} else {
+			hostname = generatedRequest.request.Host
+		}
+		formedURL = generatedRequest.request.String()
+		// if nuclei-project is available check if the request was already sent previously
+		if request.options.ProjectFile != nil {
+			// if unavailable fail silently
+			fromCache = true
+			resp, err = request.options.ProjectFile.Get(projectCacheKey)
+			if err != nil {
+				fromCache = false
+			}
+		}
+		if resp == nil || (request.Analyzer != nil && cookieFuzzing) {
+			connConfig := request.connConfiguration
+			if input.CookieJar != nil && !request.DisableCookie {
+				connConfig = connConfig.Clone()
+				connConfig.Connection.SetCookieJar(input.CookieJar)
+			}
+			if updatedTimeout, ok := generatedRequest.request.Context().Value(httpclientpool.WithCustomTimeout{}).(httpclientpool.WithCustomTimeout); ok {
+				if connConfig == request.connConfiguration {
+					connConfig = connConfig.Clone()
+				}
+				connConfig.ResponseHeaderTimeout = updatedTimeout.Timeout
+			}
+
+			// a pinned target gets its own client, so a keep-alive connection
+			// to one ip never serves a request pinned to another
+			poolKey := hostname
+			if input.MetaInput.CustomIP != "" {
+				poolKey += "@" + input.MetaInput.CustomIP
+			}
+			httpclient, clientErr := httpclientpool.Get(request.options.Options, connConfig, poolKey)
+			if clientErr != nil {
+				return errors.Wrap(clientErr, "could not get http client")
+			}
+			if cookieFuzzing {
+				httpclient, clientErr = request.preserveFuzzedCookies(httpclient, connConfig, hostname, generatedRequest.request.Request, fuzzed.FuzzedKeys)
+				if clientErr != nil {
+					return clientErr
+				}
+			}
+			executingClient = httpclient
+		}
+		if resp == nil {
+			if errSignature := request.handleSignature(generatedRequest); errSignature != nil {
+				return errSignature
+			}
+
+			// Check if HTTP-to-HTTPS port correction is needed before sending request.
+			// The correction is keyed by host:port and shared across templates, so a
+			// single wrong detection could otherwise silently break every later request
+			// to that host. We remember that a correction was applied so we can revert
+			// and retry on failure (see below).
+			var httpsCorrectionTracker *httpclientpool.HTTPToHTTPSPortTracker
+			var httpsCorrectionURL string
+			if generatedRequest.request != nil && generatedRequest.request.Request != nil && generatedRequest.request.Request.URL != nil {
+				tracker := httpclientpool.GetHTTPToHTTPSPortTracker(request.options.Options)
+				if tracker != nil {
+					requestURL := generatedRequest.request.Request.URL.String()
+					if tracker.RequiresHTTPS(requestURL) {
+						// Modify request URL scheme from http to https
+						if generatedRequest.request.Scheme == "http" {
+							generatedRequest.request.Scheme = "https"
+							tracker.RecordCorrection()
+							httpsCorrectionTracker = tracker
+							httpsCorrectionURL = requestURL
+							gologger.Debug().Msgf("[http-to-https-tracker] Corrected HTTP to HTTPS for %s", requestURL)
+						}
+					}
+				}
+			}
+
+			if request.keepsRawResponse() && generatedRequest.request.Header.Get("Accept-Encoding") == "" &&
+				generatedRequest.request.Header.Get("Range") == "" && generatedRequest.request.Method != http.MethodHead {
+				// the transport decodes a response to the gzip header it adds
+				// itself, leaving nothing raw; sending the same header keeps the
+				// request on the wire unchanged
+				generatedRequest.request.Header.Set("Accept-Encoding", "gzip")
+			}
+			if request.sharesResponse {
+				generatedRequest.request.WithContext(httpclientpool.WithSharedResponse(generatedRequest.request.Context(), request.options.TemplateID))
+			}
+			resp, err = executingClient.Do(generatedRequest.request)
+			sent = true
+
+			// Self-heal: if this is the request that *first* discovers the
+			// host:port is https-only (no prior detection, so the pre-emptive
+			// check above didn't already correct the scheme), retry it over
+			// https immediately instead of handing the guaranteed-wrong 400 to
+			// the matchers. Without this, whichever request happens to be the
+			// first (or one of several racing concurrently) to hit a given
+			// host:port is always sacrificed, even though the tracker now
+			// knows better for every other request.
+			if err == nil && httpsCorrectionTracker == nil &&
+				generatedRequest.request != nil && generatedRequest.request.Scheme == "http" &&
+				generatedRequest.request.Request != nil && generatedRequest.request.Request.URL != nil &&
+				looksLikeHTTPToHTTPSMismatch(resp) {
+
+				_, _ = io.CopyN(io.Discard, resp.Body, drainReqSize)
+				_ = resp.Body.Close()
+
+				requestURL := generatedRequest.request.Request.URL.String()
+				generatedRequest.request.Scheme = "https"
+
+				if tracker := httpclientpool.GetHTTPToHTTPSPortTracker(request.options.Options); tracker != nil {
+					tracker.RecordHTTPToHTTPSPort(requestURL)
+					tracker.RecordCorrection()
+					httpsCorrectionTracker = tracker
+					httpsCorrectionURL = requestURL
+				}
+
+				rewindRequestBody(generatedRequest.request)
+				resp, err = executingClient.Do(generatedRequest.request)
+			}
+
+			// If we forced http->https (either from a previous detection or the
+			// immediate self-heal above) and the corrected request failed (e.g.
+			// a false positive where the port actually speaks plain HTTP),
+			// revert to the original scheme, evict the bad entry so other
+			// templates hitting the same host:port are not affected, and retry
+			// once. This keeps the optimization while preventing a single
+			// wrong detection from silently dropping findings at scale.
+			if err != nil && httpsCorrectionTracker != nil && generatedRequest.request != nil && generatedRequest.request.Scheme == "https" {
+				generatedRequest.request.Scheme = "http"
+				httpsCorrectionTracker.Evict(httpsCorrectionURL)
+				rewindRequestBody(generatedRequest.request)
+				resp, err = executingClient.Do(generatedRequest.request)
+			}
+		}
+	}
+	// A project-file hit never sets sent, and a pure HTTP cache hit did not
+	// contact the origin, so neither can move the delay. Record before dump
+	// or the dialer lookup can return and drop the outcome.
+	if httpcache.ContactedOrigin(sent, resp) {
+		request.observeHostBackoff(backoffKey, resp, err)
+	}
+	// use request url as matched url if empty
+	if formedURL == "" {
+		formedURL = input.MetaInput.Input
+	}
+
+	// converts whitespace and other chars that cannot be printed to url encoded values
+	formedURL = urlutil.URLEncodeWithEscapes(formedURL)
+
+	// Dump the requests containing all headers. A race reuses the full dump
+	// stored on previous["request"]; the pre-send dump is capped.
+	if generatedRequest.original != nil && generatedRequest.original.Race {
+		if full, ok := previousEvent["request"].(string); ok && full != "" {
+			dumpedRequest.data = []byte(full)
+			dumpedRequest.truncated = 0
+		}
+	} else {
+		var dumpError error
+		dumpedRequest, dumpError = dump(generatedRequest, input.MetaInput.Input, 0)
+		if dumpError != nil {
+			return dumpError
+		}
+		dumpedRequestString := convUtil.String(capDumpBody(dumpedRequest.data, request.options.Options.RequestSaveSize))
+		if request.options.Options.Debug || request.options.Options.DebugRequests || request.options.Options.StoreResponse {
+			msg := fmt.Sprintf("[%s] Dumped HTTP request for %s\n\n", request.options.TemplateID, formedURL)
+
+			if request.options.Options.Debug || request.options.Options.DebugRequests {
+				gologger.Info().Msg(msg)
+				gologger.Print().Msgf("%s", dumpedRequestString)
+			}
+			if request.options.Options.StoreResponse {
+				request.options.Output.WriteStoreDebugData(input.MetaInput.Input, request.options.TemplateID, request.Type().String(), fmt.Sprintf("%s\n%s", msg, dumpedRequestString))
+			}
+		}
+	}
+
+	dialers := protocolstate.GetDialersWithId(request.options.Options.ExecutionId)
+	if dialers == nil {
+		return fmt.Errorf("dialers not found for execution id %s", request.options.Options.ExecutionId)
+	}
+	var getDialedIP func(string) string
+	if dialers.Fastdialer != nil {
+		getDialedIP = dialers.Fastdialer.GetDialedIP
+	}
+	targetHost := hostname
+
+	if err != nil {
+		// rawhttp doesn't support draining response bodies.
+		if resp != nil && resp.Body != nil && generatedRequest.rawRequest == nil && !generatedRequest.original.Pipeline {
+			_, _ = io.CopyN(io.Discard, resp.Body, drainReqSize)
+			_ = resp.Body.Close()
+		}
+		request.options.Output.Request(request.options.TemplatePath, formedURL, request.Type().String(), err)
+
+		// In case of interactsh markers and request times out, still send
+		// a callback event so in case we receive an interaction, correlation is possible.
+		// Also, to log failed use-cases.
+		outputEvent := request.responseToDSLMap(&http.Response{}, input.MetaInput.Input, formedURL, convUtil.String(dumpedRequest.data), "", "", "", 0, generatedRequest.meta)
+		if i := strings.LastIndex(hostname, ":"); i != -1 {
+			hostname = hostname[:i]
+		}
+
+		outputEvent["ip"] = outputIP(input.MetaInput.CustomIP, targetHost, hostname, getDialedIP)
+		if input.MetaInput.CustomIP == "" {
+			// try getting cname
+			request.addCNameIfAvailable(hostname, outputEvent)
+		}
+
+		if len(generatedRequest.interactshURLs) > 0 {
+			// according to logic we only need to trigger a callback if interactsh was used
+			// and request failed in hope that later on oast interaction will be received
+			event := &output.InternalWrappedEvent{}
+			if request.CompiledOperators != nil && request.CompiledOperators.HasDSL() {
+				event.InternalEvent = outputEvent
+			}
+			callback(event)
+		}
+		return err
+	}
+
+	var curlCommand string
+	if !request.Unsafe && resp != nil && generatedRequest.request != nil && resp.Request != nil && !request.Race {
+		body := generatedRequest.body()
+		// Use a clone to avoid a race condition with the http transport
+		req := resp.Request.Clone(resp.Request.Context())
+		// Large bodies are left out to keep the command readable.
+		omitBody := len(body) > maxCurlBodySize
+		if omitBody {
+			req.Body = nil
+			req.Header.Del("Content-Length")
+		} else {
+			req.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		command, err := http2curl.GetCurlCommand(req)
+		if err == nil && command != nil {
+			curlCommand = command.String()
+			if omitBody {
+				curlCommand += fmt.Sprintf(" # body omitted: %d bytes", len(body))
+			}
+		}
+	}
+
+	gologger.Verbose().Msgf("[%s] Sent HTTP request to %s", request.options.TemplateID, formedURL)
+	request.options.Output.Request(request.options.TemplatePath, formedURL, request.Type().String(), err)
+
+	duration := time.Since(timeStart)
+
+	// define max body read limit
+	maxBodylimit := request.getEffectiveReadLimit()
+
+	// respChain is http response chain that reads response body
+	// efficiently by reusing buffers and does all decoding and optimizations
+	newResponseChain := httpUtils.NewResponseChain
+	// The project file stores the bytes as received, because a replay decodes
+	// them again and a decoded body would be decoded twice.
+	if request.keepsRawResponse() || request.options.ProjectFile != nil {
+		newResponseChain = httpUtils.NewResponseChainWithRaw
+	}
+	respChain := newResponseChain(resp, int64(maxBodylimit))
+	defer respChain.Close() // reuse buffers
+
+	// we only intend to log/save the final redirected response
+	// i.e why we have to use sync.Once to ensure it's only done once
+	var errx error
+	// Race skips the dumps above because the body is already waiting on the
+	// gate. executeRaceRequest stored those bytes for DSL use.
+	if generatedRequest.original != nil && generatedRequest.original.Race && len(dumpedRequest.data) == 0 {
+		if raw, ok := previousEvent["request"].(string); ok {
+			dumpedRequest = requestDump{data: []byte(raw)}
+		}
+	}
+	// One executed request is replayed once, even when several responses in
+	// the redirect chain match.
+	replayed := false
+	// The chain is walked from the final response back through its redirects.
+	finalResponse := true
+
+	onceFunc := sync.OnceFunc(func() {
+		// if nuclei-project is enabled store the response if not previously done
+		if request.options.ProjectFile != nil && !fromCache {
+			if err := request.options.ProjectFile.Set(projectCacheKey, resp, respChain.RawBodyBytes()); err != nil {
+				errx = errors.Wrap(err, "could not store in project file")
+			}
+		}
+	})
+
+	// evaluate responses continuously until first redirect request in reverse order
+	for respChain.Has() {
+		// fill buffers, read response body and reuse connection
+		if err := respChain.Fill(); err != nil {
+			return errors.Wrap(err, "could not generate response chain")
+		}
+
+		// Cache response strings once per Fill() to avoid repeated allocs.
+		// NOTE(dwisiswant0): These are valid until Previous() (which reloads
+		// the buffer).
+		bodyStr := respChain.BodyString()
+		headersStr := respChain.HeadersString()
+
+		statusCode := respChain.Response().StatusCode
+
+		needsFullResponse := request.needsFullResponse(generatedRequest)
+		var fullResponseStr string
+		var fullResponseOnce sync.Once
+		getFullResponse := func() string {
+			fullResponseOnce.Do(func() {
+				fullResponseStr = respChain.FullResponseString()
+			})
+			return fullResponseStr
+		}
+		if needsFullResponse {
+			fullResponseStr = getFullResponse()
+		}
+
+		// Detect HTTP-to-HTTPS port mismatch (400 error with specific message) so
+		// later requests to the same host:port are auto-upgraded to https. For the
+		// standard net/http path this is normally already handled by the
+		// immediate self-heal above; this remains the only detection point for
+		// pipeline/unsafe (rawhttp) requests, which bypass that retry.
+		if statusCode == 400 && strings.Contains(bodyStr, httpToHTTPSMismatchSignature) {
+			var requestURL string
+			if generatedRequest.request != nil && generatedRequest.request.Request != nil && generatedRequest.request.Request.URL != nil {
+				requestURL = generatedRequest.request.Request.URL.String()
+			} else if generatedRequest.rawRequest != nil && generatedRequest.rawRequest.FullURL != "" {
+				requestURL = generatedRequest.rawRequest.FullURL
+			} else if respChain.Request() != nil && respChain.Request().URL != nil {
+				requestURL = respChain.Request().URL.String()
+			}
+			if requestURL != "" {
+				httpclientpool.RecordHTTPToHTTPSPortMismatch(request.options.Options, requestURL)
+			}
+		}
+
+		// log request stats
+		request.options.Output.RequestStatsLog(strconv.Itoa(statusCode), fullResponseStr)
+
+		// save response to projectfile
+		onceFunc()
+		matchedURL := input.MetaInput.Input
+		if generatedRequest.rawRequest != nil {
+			if generatedRequest.rawRequest.FullURL != "" {
+				matchedURL = generatedRequest.rawRequest.FullURL
+			} else {
+				matchedURL = formedURL
+			}
+		}
+		if generatedRequest.request != nil {
+			matchedURL = generatedRequest.request.String()
+		}
+		// Give precedence to the final URL from response
+		if respChain.Request() != nil {
+			if responseURL := respChain.Request().URL.String(); responseURL != "" {
+				matchedURL = responseURL
+			}
+		}
+
+		finalEvent := make(output.InternalEvent)
+
+		if request.Analyzer != nil {
+			analyzer := analyzers.GetAnalyzer(request.Analyzer.Name)
+			// Reuse the request's client so the analyzer inherits its cookie jar,
+			// fuzz protection, and timeout. Other execution paths (pipeline/unsafe)
+			// fall back to a per-host lookup.
+			analyzerClient := executingClient
+			if analyzerClient == nil {
+				analyzerClient = request.getHTTPClientForHost(hostname)
+			}
+			if analyzerClient == nil {
+				gologger.Warning().Msgf("Could not get http client for analyzer %s on %s, skipping analysis\n", request.Analyzer.Name, hostname)
+			} else {
+				analysisMatched, analysisDetails, err := analyzer.Analyze(&analyzers.Options{
+					FuzzGenerated:      generatedRequest.fuzzGeneratedRequest,
+					HttpClient:         analyzerClient,
+					ResponseTimeDelay:  duration,
+					AnalyzerParameters: request.Analyzer.Parameters,
+				})
+				if err != nil {
+					gologger.Warning().Msgf("Could not analyze response: %v\n", err)
+				}
+				if analysisMatched {
+					finalEvent["analyzer_details"] = analysisDetails
+					finalEvent["analyzer"] = true
+				}
+			}
+		}
+
+		outputEvent := request.responseToDSLMap(respChain.Response(), input.MetaInput.Input, matchedURL, convUtil.String(dumpedRequest.data), fullResponseStr, bodyStr, headersStr, duration, generatedRequest.meta)
+		if request.keepsRawResponse() {
+			outputEvent["raw_body"] = respChain.RawBodyString()
+			outputEvent["raw_response"] = respChain.RawFullResponseString()
+		}
+		// add response fields to template context and merge templatectx variables to output event
+		request.options.AddTemplateVars(input.MetaInput, request.Type(), request.ID, outputEvent)
+		if request.options.HasTemplateCtx(input.MetaInput) {
+			outputEvent = generators.MergeMaps(outputEvent, request.options.GetTemplateCtx(input.MetaInput).GetAll())
+		}
+		if i := strings.LastIndex(hostname, ":"); i != -1 {
+			hostname = hostname[:i]
+		}
+		outputEvent["curl-command"] = curlCommand
+		outputEvent["ip"] = outputIP(input.MetaInput.CustomIP, targetHost, hostname, getDialedIP)
+		if input.MetaInput.CustomIP == "" {
+			// try getting cname
+			request.addCNameIfAvailable(hostname, outputEvent)
+		}
+		if request.options.Interactsh != nil {
+			request.options.Interactsh.MakePlaceholders(generatedRequest.interactshURLs, outputEvent)
+		}
+		maps.Copy(finalEvent, previousEvent)
+		maps.Copy(finalEvent, outputEvent)
+
+		// Add to history the current request number metadata if asked by the user.
+		if request.NeedsRequestCondition() {
+			for k, v := range outputEvent {
+				key := fmt.Sprintf("%s_%d", k, requestCount)
+				if previousEvent != nil {
+					previousEvent[key] = v
+				}
+				finalEvent[key] = v
+			}
+		}
+		// prune signature internal values if any
+		request.pruneSignatureInternalValues(generatedRequest.meta)
+
+		interimEvent := generators.MergeMaps(generatedRequest.dynamicValues, finalEvent)
+		interimEvent["payloads"] = generatedRequest.meta
+		// add the request URL pattern to the event BEFORE operators execute
+		// so that interactsh events etc can also access it
+		if request.options.ExportReqURLPattern {
+			interimEvent[ReqURLPatternKey] = generatedRequest.requestURLPattern
+		}
+		isDebug := request.options.Options.Debug || request.options.Options.DebugResponse
+		event := eventcreator.CreateEventWithAdditionalOptions(request, interimEvent, isDebug, func(internalWrappedEvent *output.InternalWrappedEvent) {
+			internalWrappedEvent.OperatorsResult.PayloadValues = generatedRequest.meta
+			if internalWrappedEvent.InternalEvent["response"] == "" || internalWrappedEvent.InternalEvent["response"] == nil {
+				internalWrappedEvent.InternalEvent["response"] = getFullResponse()
+			}
+		})
+
+		if hasInteractMatchers {
+			event.UsesInteractsh = true
+		}
+
+		// Earlier responses in the chain are redirects the template did not ask
+		// to match on, and the baseline only follows the final answer.
+		if finalResponse {
+			event.CatchAll = request.catchAllCheck(executingClient, generatedRequest, catchall.Response{
+				StatusCode: statusCode,
+				Location:   respChain.Response().Header.Get("Location"),
+				Body:       bodyStr,
+			}, backoffKey)
+		}
+		if event.CatchAll != nil && event.OperatorsResult != nil && catchall.Applies(request.options.TemplateInfo, request.CompiledOperators) && event.CatchAll() {
+			gologger.Verbose().Msgf("[%s] Dropped match on %s: the host serves this page for any missing path", request.options.TemplateID, formedURL)
+			event.OperatorsResult = nil
+			event.Results = nil
+		}
+
+		globalMatched := false
+		if request.options.GlobalMatchers.HasMatchers() {
+			request.options.GlobalMatchers.Match(interimEvent, request.Match, request.Extract, isDebug, func(event output.InternalEvent, result *operators.Result) {
+				globalMatched = true
+				if event["response"] == "" || event["response"] == nil {
+					event["response"] = getFullResponse()
+				}
+				callback(eventcreator.CreateEventWithOperatorResults(request, event, result))
+			})
+		}
+
+		responseContentType := respChain.Response().Header.Get("Content-Type")
+		isResponseTruncated := respChain.Body().Len() >= maxBodylimit
+		dumpResponse(event, request, fullResponseStr, formedURL, responseContentType, isResponseTruncated, input.MetaInput.Input)
+
+		callback(event)
+
+		localMatched := event.OperatorsResult != nil && event.OperatorsResult.Matched
+		if !replayed && (localMatched || globalMatched) {
+			replayed = true
+			var replayBody []byte
+			if dumpedRequest.truncated > 0 {
+				replayBody = generatedRequest.body()
+			}
+			request.replayRequest(dumpedRequest.data, replayBody, formedURL)
+		}
+
+		if request.options.FuzzStatsDB != nil && generatedRequest.fuzzGeneratedRequest.Request != nil {
+			request.options.FuzzStatsDB.RecordResultEvent(fuzzStats.FuzzingEvent{
+				URL:           input.MetaInput.Target(),
+				TemplateID:    request.options.TemplateID,
+				ComponentType: generatedRequest.fuzzGeneratedRequest.Component.Name(),
+				ComponentName: generatedRequest.fuzzGeneratedRequest.Parameter,
+				PayloadSent:   generatedRequest.fuzzGeneratedRequest.Value,
+				StatusCode:    respChain.Response().StatusCode,
+				Matched:       event.HasResults(),
+				RawRequest:    string(capDumpBody(dumpedRequest.data, request.options.Options.RequestSaveSize)),
+				RawResponse:   getFullResponse(),
+				Severity:      request.options.TemplateInfo.SeverityHolder.Severity.String(),
+			})
+		}
+
+		// Skip further responses if we have stop-at-first-match and a match
+		if (request.options.Options.StopAtFirstMatch || request.options.StopAtFirstMatch || request.StopAtFirstMatch) && event.HasResults() {
+			return nil
+		}
+		finalResponse = false
+		// proceed with previous response
+		// we evaluate operators recursively for each response
+		// until we reach the first redirect response
+		if !respChain.Previous() {
+			break
+		}
+	}
+	// return project file save error if any
+	return errx
+}
+
+// validateNFixEvent validates and fixes the event
+// it adds any missing template-id and request-url-pattern
+func (request *Request) validateNFixEvent(input *contextargs.Context, gr *generatedRequest, err error, event *output.InternalWrappedEvent) {
+	if event != nil {
+		if event.InternalEvent == nil {
+			event.InternalEvent = make(map[string]interface{})
+			event.InternalEvent["template-id"] = request.options.TemplateID
+		}
+		// add the request URL pattern to the event
+		event.InternalEvent[ReqURLPatternKey] = gr.requestURLPattern
+		if event.InternalEvent["host"] == nil {
+			event.InternalEvent["host"] = input.MetaInput.Input
+		}
+		if event.InternalEvent["template-id"] == nil {
+			event.InternalEvent["template-id"] = request.options.TemplateID
+		}
+		if event.InternalEvent["type"] == nil {
+			event.InternalEvent["type"] = request.Type().String()
+		}
+		if event.InternalEvent["template-path"] == nil {
+			event.InternalEvent["template-path"] = request.options.TemplatePath
+		}
+		if event.InternalEvent["template-info"] == nil {
+			event.InternalEvent["template-info"] = request.options.TemplateInfo
+		}
+		if err != nil {
+			event.InternalEvent["error"] = err.Error()
+		}
+	}
+}
+
+// getHTTPClientForHost returns a per-host HTTP client, falling back to a
+// host-agnostic client if the lookup fails.
+func (request *Request) getHTTPClientForHost(host string) *retryablehttp.Client {
+	client, err := httpclientpool.Get(request.options.Options, request.connConfiguration, host)
+	if err != nil {
+		client, _ = httpclientpool.Get(request.options.Options, request.connConfiguration, "")
+	}
+	return client
+}
+
+// outputIP returns the ip for the output event. host is the request host as
+// sent and hostname is host with the port stripped.
+func outputIP(customIP, host, hostname string, getDialedIP func(string) string) string {
+	if customIP != "" {
+		return customIP
+	}
+	if getDialedIP != nil {
+		if ip := getDialedIP(hostname); ip != "" {
+			return ip
+		}
+	}
+	// proxies bypass fastdialer's dial history, so fall back to an IP literal host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	if iputil.IsIP(host) {
+		return host
+	}
+	return ""
+}
+
+// addCNameIfAvailable adds the cname to the event if available
+func (request *Request) addCNameIfAvailable(hostname string, outputEvent map[string]interface{}) {
+	if request.dialer == nil {
+		return
+	}
+
+	if request.options.Interactsh != nil {
+		interactshDomain := request.options.Interactsh.GetHostname()
+		if interactshDomain != "" {
+			if strings.EqualFold(hostname, interactshDomain) || strings.HasSuffix(hostname, "."+interactshDomain) {
+				return
+			}
+		}
+	}
+
+	data, err := request.dialer.GetDNSData(hostname)
+	if err == nil {
+		switch len(data.CNAME) {
+		case 0:
+			return
+		case 1:
+			outputEvent["cname"] = data.CNAME[0]
+		default:
+			// add 1st and put others in cname_all
+			outputEvent["cname"] = data.CNAME[0]
+			outputEvent["cname_all"] = data.CNAME
+		}
+	}
+}
+
+// handleSignature of the http request
+func (request *Request) handleSignature(generatedRequest *generatedRequest) error {
+	switch request.Signature.Value {
+	case AWSSignature:
+		var awsSigner signer.Signer
+		allvars := generators.MergeMaps(request.options.Options.Vars.AsMap(), generatedRequest.dynamicValues)
+		awsopts := signer.AWSOptions{
+			AwsID:          types.ToString(allvars["aws-id"]),
+			AwsSecretToken: types.ToString(allvars["aws-secret"]),
+		}
+		awsSigner, err := signerpool.Get(request.options.Options, &signerpool.Configuration{SignerArgs: &awsopts})
+		if err != nil {
+			return err
+		}
+		ctx := signer.GetCtxWithArgs(allvars, signer.AwsDefaultVars)
+		err = awsSigner.SignHTTP(ctx, generatedRequest.request.Request)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// setCustomHeaders sets the custom headers for generated request
+func (request *Request) setCustomHeaders(req *generatedRequest) {
+	for k, v := range request.customHeaders {
+		v = request.evaluateCustomHeaderValue(req, v)
+		if req.rawRequest != nil {
+			req.rawRequest.Headers[k] = v
+		} else {
+			kk, vv := strings.TrimSpace(k), strings.TrimSpace(v)
+			// NOTE(dwisiswant0): Do we really not need to convert it first into
+			// lowercase?
+			if kk == "Host" {
+				req.request.Host = vv
+
+				continue
+			}
+
+			req.request.Header[kk] = []string{vv}
+		}
+	}
+}
+
+// evaluateCustomHeaderValue resolves helper expressions inside a global custom
+// header value. It runs once per generated request, so helpers such as
+// rand_user_agent() yield a fresh value per request instead of being frozen at
+// compile time. A bad expression degrades the header instead of failing the
+// scan.
+func (request *Request) evaluateCustomHeaderValue(req *generatedRequest, value string) string {
+	values := generators.MergeMaps(req.dynamicValues, req.meta)
+	return evaluateCustomHeaderExpressions(request.options.TemplateID, value, values)
+}
+
+// evaluateCustomHeaderExpressions resolves helper expressions in a global custom
+// header string. Unsafe raw requests splice the -H line straight into the
+// request bytes, so they resolve it here instead of in setCustomHeaders.
+func evaluateCustomHeaderExpressions(templateID, value string, values map[string]interface{}) string {
+	if !strings.Contains(value, marker.ParenthesisOpen) {
+		return value
+	}
+	evaluated, err := expressions.Evaluate(value, values)
+	if err != nil {
+		gologger.Debug().Msgf("[%s] could not evaluate custom header value %q: %s", templateID, value, err)
+		return value
+	}
+	return evaluated
+}
+
+const CRLF = "\r\n"
+
+func dumpResponse(event *output.InternalWrappedEvent, request *Request, redirectedResponse string, formedURL string, responseContentType string, isResponseTruncated bool, reqURL string) {
+	cliOptions := request.options.Options
+	if cliOptions.Debug || cliOptions.DebugResponse || cliOptions.StoreResponse {
+		response := redirectedResponse
+
+		var highlightedResult string
+		if (responseContentType == "application/octet-stream" || responseContentType == "application/x-www-form-urlencoded") && responsehighlighter.HasBinaryContent(response) {
+			highlightedResult = createResponseHexDump(event, response, cliOptions.NoColor)
+		} else {
+			highlightedResult = responsehighlighter.Highlight(event.OperatorsResult, response, cliOptions.NoColor, false)
+		}
+
+		msg := "[%s] Dumped HTTP response %s\n\n%s"
+		if isResponseTruncated {
+			msg = "[%s] Dumped HTTP response (Truncated) %s\n\n%s"
+		}
+		fMsg := fmt.Sprintf(msg, request.options.TemplateID, formedURL, highlightedResult)
+		if cliOptions.Debug || cliOptions.DebugResponse {
+			gologger.Debug().Msg(fMsg)
+		}
+		if cliOptions.StoreResponse {
+			request.options.Output.WriteStoreDebugData(reqURL, request.options.TemplateID, request.Type().String(), fMsg)
+		}
+	}
+}
+
+func createResponseHexDump(event *output.InternalWrappedEvent, response string, noColor bool) string {
+	CRLFs := CRLF + CRLF
+	headerEndIndex := strings.Index(response, CRLFs) + len(CRLFs)
+	if headerEndIndex > 0 {
+		headers := response[0:headerEndIndex]
+		responseBodyHexDump := hex.Dump([]byte(response[headerEndIndex:]))
+
+		highlightedHeaders := responsehighlighter.Highlight(event.OperatorsResult, headers, noColor, false)
+		highlightedResponse := responsehighlighter.Highlight(event.OperatorsResult, responseBodyHexDump, noColor, true)
+		return fmt.Sprintf("%s\n%s", highlightedHeaders, highlightedResponse)
+	} else {
+		return responsehighlighter.Highlight(event.OperatorsResult, hex.Dump([]byte(response)), noColor, true)
+	}
+}
+
+func (request *Request) pruneSignatureInternalValues(maps ...map[string]interface{}) {
+	var signatureFieldsToSkip map[string]interface{}
+	switch request.Signature.Value {
+	case AWSSignature:
+		signatureFieldsToSkip = signer.AwsInternalOnlyVars
+	default:
+		return
+	}
+
+	for _, m := range maps {
+		for fieldName := range signatureFieldsToSkip {
+			delete(m, fieldName)
+		}
+	}
+}
+
+// recordHostResult updates the host-errors cache with the outcome of a request.
+// A failure is counted; a success resets the host, so only consecutive failures
+// with no success in between can mark a host unresponsive.
+func (request *Request) recordHostResult(input *contextargs.Context, err error) {
+	if request.options.HostErrorsCache != nil {
+		request.options.HostErrorsCache.MarkFailedOrRemove(request.options.ProtocolType.String(), input, err)
+	}
+}
+
+func (request *Request) recordHostResultAndCancelIfUnresponsive(input *contextargs.Context, err error, cancel func()) {
+	request.recordHostResult(input, err)
+	if request.isUnresponsiveAddress(input) {
+		cancel()
+	}
+}
+
+// skipUnresponsive reports whether the address input stands for is
+// unresponsive. When it is, it notes in skipped that a request was not sent.
+func (request *Request) skipUnresponsive(input *contextargs.Context, skipped *atomic.Bool) bool {
+	unresponsive := request.isUnresponsiveAddress(input)
+	if unresponsive {
+		skipped.Store(true)
+	}
+
+	return unresponsive
+}
+
+// requestsError joins the errors that the requests of one execution returned.
+// A request error takes precedence over a skip for an unresponsive address,
+// which is returned only when no request failed.
+func requestsError(results []error, skipped bool) error {
+	failures := make([]error, 0, len(results))
+
+	for _, err := range results {
+		if errors.Is(err, hosterrorscache.ErrUnresponsiveHost) {
+			skipped = true
+
+			continue
+		}
+
+		failures = append(failures, err)
+	}
+
+	err := multierr.Combine(failures...)
+	if err != nil {
+		return err //nolint:wrapcheck // the requests' own errors, which callers read as they are
+	}
+
+	if skipped {
+		return hosterrorscache.ErrUnresponsiveHost
+	}
+
+	return nil
+}
+
+// isUnresponsiveAddress checks if the error is a unreponsive based on its execution history
+func (request *Request) isUnresponsiveAddress(input *contextargs.Context) bool {
+	if request.options.HostErrorsCache != nil {
+		return request.options.HostErrorsCache.Check(request.options.ProtocolType.String(), input)
+	}
+	return false
+}
+
+// needsFullResponse returns true if operators, debug flags, or stats require the full HTTP response.
+// RequireFullResponse keeps the full response when a caller matches this
+// request's event with operators the request does not own. Clustered templates do that.
+func (request *Request) RequireFullResponse() {
+	if request == nil {
+		return
+	}
+	request.requireFullResponse = true
+}
+
+// FullResponseRequired reports whether RequireFullResponse has been set.
+func (request *Request) FullResponseRequired() bool {
+	return request != nil && request.requireFullResponse
+}
+
+func (request *Request) needsFullResponse(generatedRequest *generatedRequest) bool {
+	if request.requireFullResponse {
+		return true
+	}
+	if request.options != nil && request.options.Options != nil {
+		cliOptions := request.options.Options
+		// -ms writes the response of failed requests too, and a failure never reaches the lazy fill
+		if cliOptions.Debug || cliOptions.DebugResponse || cliOptions.StoreResponse || cliOptions.HTTPStats || cliOptions.MatcherStatus {
+			return true
+		}
+	}
+	if vardump.EnableVarDump {
+		return true
+	}
+	if request.options != nil && request.options.FuzzStatsDB != nil && generatedRequest != nil && generatedRequest.fuzzGeneratedRequest.Request != nil {
+		return true
+	}
+	if request.options != nil && (request.options.IsMultiProtocol || request.options.Flow != "") {
+		return true
+	}
+	// request-condition history copies the event, so later requests can read response_N
+	if request.NeedsRequestCondition() {
+		return true
+	}
+	if request.CompiledOperators != nil && request.CompiledOperators.NeedsResponse() {
+		return true
+	}
+	if request.NeedsResponse() {
+		return true
+	}
+	for _, filter := range request.FuzzPreCondition {
+		if filter.NeedsResponse() {
+			return true
+		}
+	}
+	if request.options != nil && request.options.GlobalMatchers != nil && request.options.GlobalMatchers.NeedsResponse() {
+		return true
+	}
+	return false
+}
+
+// getEffectiveReadLimit returns the effective body read limit for this request.
+func (request *Request) getEffectiveReadLimit() int {
+	maxBodylimit := MaxBodyRead // 10MB
+	if request.MaxSize > 0 {
+		maxBodylimit = request.MaxSize
+	}
+	if request.options.Options.ResponseReadSize > 0 {
+		if request.MaxSize > 0 {
+			maxBodylimit = min(request.MaxSize, request.options.Options.ResponseReadSize)
+		} else {
+			maxBodylimit = request.options.Options.ResponseReadSize
+		}
+	}
+	return maxBodylimit
+}

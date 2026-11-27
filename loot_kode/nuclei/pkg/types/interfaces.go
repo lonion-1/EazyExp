@@ -1,0 +1,227 @@
+// Taken from https://github.com/spf13/cast.
+
+package types
+
+import (
+	"bytes"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/projectdiscovery/nuclei/v3/pkg/model/types/severity"
+)
+
+// JSONScalarToString converts an interface coming from json to string
+// Inspired from: https://github.com/cli/cli/blob/09b09810dd812e3ede54b59ad9d6912b946ac6c5/pkg/export/template.go#L72
+func JSONScalarToString(input interface{}) (string, error) {
+	switch tt := input.(type) {
+	case string:
+		return ToString(tt), nil
+	case float64:
+		return ToString(tt), nil
+	case nil:
+		return ToString(tt), nil
+	case bool:
+		return ToString(tt), nil
+	default:
+		return "", fmt.Errorf("cannot convert type to string: %v", tt)
+	}
+}
+
+// ToString converts an interface to string in a quick way
+func ToString(data interface{}) string {
+	switch s := data.(type) {
+	case nil:
+		return ""
+	case string:
+		return s
+	case bool:
+		return strconv.FormatBool(s)
+	case float64:
+		return strconv.FormatFloat(s, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(s), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(s)
+	case int64:
+		return strconv.FormatInt(s, 10)
+	case int32:
+		return strconv.Itoa(int(s))
+	case int16:
+		return strconv.FormatInt(int64(s), 10)
+	case int8:
+		return strconv.FormatInt(int64(s), 10)
+	case uint:
+		return strconv.FormatUint(uint64(s), 10)
+	case uint64:
+		return strconv.FormatUint(s, 10)
+	case uint32:
+		return strconv.FormatUint(uint64(s), 10)
+	case uint16:
+		return strconv.FormatUint(uint64(s), 10)
+	case uint8:
+		return strconv.FormatUint(uint64(s), 10)
+	case []byte:
+		return string(s)
+	case severity.Holder:
+		return s.Severity.String()
+	case severity.Severity:
+		return s.String()
+	case fmt.Stringer:
+		return s.String()
+	case error:
+		return s.Error()
+	default:
+		return fmt.Sprintf("%v", data)
+	}
+}
+
+// ToStringNSlice converts an interface to string in a quick way or to a slice with strings
+// if the input is a slice of interfaces.
+func ToStringNSlice(data interface{}) interface{} {
+	switch s := data.(type) {
+	case []interface{}:
+		var a []string
+		for _, v := range s {
+			a = append(a, ToString(v))
+		}
+		return a
+	default:
+		return ToString(data)
+	}
+}
+
+func ToHexOrString(data interface{}) string {
+	switch s := data.(type) {
+	case string:
+		if isASCII(s) {
+			return s
+		}
+		return hex.Dump([]byte(s))
+	case []byte:
+		return hex.Dump(s)
+	default:
+		return fmt.Sprintf("%v", data)
+	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+// ToStringSlice casts an interface to a []string type.
+func ToStringSlice(i interface{}) []string {
+	var a []string
+
+	switch v := i.(type) {
+	case []interface{}:
+		for _, u := range v {
+			a = append(a, ToString(u))
+		}
+		return a
+	case []string:
+		return v
+	case string:
+		return strings.Fields(v)
+	default:
+		return nil
+	}
+}
+
+// ToByteSlice casts an interface to a []byte type.
+func ToByteSlice(i interface{}) []byte {
+	switch v := i.(type) {
+	case []byte:
+		return v
+	case []string:
+		return []byte(strings.Join(v, ""))
+	case string:
+		return []byte(v)
+	case []interface{}:
+		var buff bytes.Buffer
+		for _, u := range v {
+			buff.WriteString(ToString(u))
+		}
+		return buff.Bytes()
+	default:
+		strValue := ToString(i)
+		return []byte(strValue)
+	}
+}
+
+// ToStringMap casts an interface to a map[string]interface{} type.
+func ToStringMap(i interface{}) map[string]interface{} {
+	var m = map[string]interface{}{}
+
+	switch v := i.(type) {
+	case map[interface{}]interface{}:
+		for k, val := range v {
+			m[ToString(k)] = val
+		}
+		return m
+	case map[string]interface{}:
+		return v
+	default:
+		return nil
+	}
+}
+
+// ToJSONValue returns a copy of value in which every map[interface{}]interface{}
+// nested in maps and slices becomes a map[string]interface{} keyed by the
+// fmt.Sprint form of its keys. Template YAML decodes nested maps with
+// interface keys, which the JSON encoder rejects. Two keys sharing a
+// fmt.Sprint form, such as 1 and 1.0, return an error.
+func ToJSONValue(value interface{}) (interface{}, error) {
+	switch typed := value.(type) {
+	case map[interface{}]interface{}:
+		converted := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			name := fmt.Sprint(key)
+			if _, exists := converted[name]; exists {
+				return nil, fmt.Errorf("map key %q collides after string conversion", name)
+			}
+			encoded, err := ToJSONValue(item)
+			if err != nil {
+				return nil, err
+			}
+			converted[name] = encoded
+		}
+		return converted, nil
+	case map[string]interface{}:
+		return ToJSONMap(typed)
+	case []interface{}:
+		converted := make([]interface{}, len(typed))
+		for i, item := range typed {
+			encoded, err := ToJSONValue(item)
+			if err != nil {
+				return nil, err
+			}
+			converted[i] = encoded
+		}
+		return converted, nil
+	default:
+		return value, nil
+	}
+}
+
+// ToJSONMap applies ToJSONValue to every value of m, returning nil for a nil m.
+func ToJSONMap(m map[string]interface{}) (map[string]interface{}, error) {
+	if m == nil {
+		return nil, nil
+	}
+	converted := make(map[string]interface{}, len(m))
+	for key, item := range m {
+		encoded, err := ToJSONValue(item)
+		if err != nil {
+			return nil, err
+		}
+		converted[key] = encoded
+	}
+	return converted, nil
+}

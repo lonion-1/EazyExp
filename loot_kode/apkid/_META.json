@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T06:51:09.100416+00:00",
+  "name": "apkid",
+  "repo": "rednaga/APKiD",
+  "branch": "master",
+  "license": "NOASSERTION",
+  "stars": 2643,
+  "commit_sha": "f132f1b29c1f5d5e9eca0eb09f90fcc1b83a7ccd",
+  "last_commit_date": "2026-10-21T11:42:59Z",
+  "files_count": 18,
+  "total_bytes": 92043,
+  "output_dir": "./loot_kode/apkid"
+}

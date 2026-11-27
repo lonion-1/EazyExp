@@ -1,0 +1,194 @@
+package input
+
+import (
+	"net"
+	"path/filepath"
+	"strings"
+
+	"github.com/projectdiscovery/hmap/store/hybrid"
+	templateTypes "github.com/projectdiscovery/nuclei/v3/pkg/templates/types"
+	fileutil "github.com/projectdiscovery/utils/file"
+	"github.com/projectdiscovery/utils/ports"
+	stringsutil "github.com/projectdiscovery/utils/strings"
+	urlutil "github.com/projectdiscovery/utils/url"
+)
+
+// Helper is a structure for helping with input transformation
+type Helper struct {
+	InputsHTTP *hybrid.HybridMap
+}
+
+// NewHelper returns a new input helper instance
+func NewHelper() *Helper {
+	helper := &Helper{}
+	return helper
+}
+
+// Close closes the resources associated with input helper
+func (h *Helper) Close() error {
+	var err error
+	if h.InputsHTTP != nil {
+		err = h.InputsHTTP.Close()
+	}
+	return err
+}
+
+// Transform transforms an input based on protocol type and returns
+// appropriate input based on it.
+func (h *Helper) Transform(input string, protocol templateTypes.ProtocolType) string {
+	switch protocol {
+	case templateTypes.DNSProtocol, templateTypes.WHOISProtocol:
+		return h.convertInputToType(input, typeHostOnly, "")
+	case templateTypes.FileProtocol, templateTypes.OfflineHTTPProtocol:
+		return h.convertInputToType(input, typeFilepath, "")
+	case templateTypes.HTTPProtocol, templateTypes.HeadlessProtocol:
+		return h.convertInputToType(input, typeURL, "")
+	case templateTypes.NetworkProtocol:
+		return h.convertInputToType(input, typeHostWithOptionalPort, "")
+	case templateTypes.WebsocketProtocol:
+		return h.convertInputToType(input, typeWebsocket, "")
+	case templateTypes.SSLProtocol:
+		return h.convertInputToType(input, typeHostWithPort, "443")
+	}
+	return input
+}
+
+// TransformPinned is Transform for an input pinned to ip, which takes the
+// HTTP probe result made through that ip and never the result of the input
+// without an ip, as that one may come from another server.
+func (h *Helper) TransformPinned(input, ip string, protocol templateTypes.ProtocolType) string {
+	if ip == "" || (protocol != templateTypes.HTTPProtocol && protocol != templateTypes.HeadlessProtocol) {
+		return h.Transform(input, protocol)
+	}
+	if h.InputsHTTP != nil {
+		if probed, ok := h.InputsHTTP.Get(ProbeKey(input, ip)); ok {
+			return string(probed)
+		}
+	}
+	// no probe through this ip: convert it as an input that was not probed
+	return (&Helper{}).Transform(input, protocol)
+}
+
+// ProbeKey returns the key of the HTTP probe result of input in InputsHTTP.
+// A target pinned to an ip is probed through that ip, so each ip has its own.
+// The separator cannot occur in an input, which may hold an "@" of its own.
+func ProbeKey(input, ip string) string {
+	if ip == "" {
+		return input
+	}
+	return input + "\x00" + ip
+}
+
+type inputType int
+
+const (
+	typeHostOnly inputType = iota + 1
+	typeHostWithPort
+	typeHostWithOptionalPort
+	typeURL
+	typeFilepath
+	typeWebsocket
+)
+
+// convertInputToType converts an input based on an inputType.
+// Various formats are supported for inputs and their transformation
+func (h *Helper) convertInputToType(input string, inputType inputType, defaultPort string) string {
+	isURL := strings.Contains(input, "://")
+	uri, _ := urlutil.Parse(input)
+	// Parse treats a single-label host such as "intranet" as a relative path
+	// and clears Host. The input is already absolute, so parse it as one.
+	if isURL {
+		if abs, err := urlutil.ParseAbsoluteURL(input, false); err == nil {
+			uri = abs
+		}
+	}
+
+	var host, port string
+	if isURL && uri != nil {
+		host, port, _ = net.SplitHostPort(uri.Host)
+	} else {
+		host, port, _ = net.SplitHostPort(input)
+	}
+
+	hasHost := host != ""
+	hasPort := ports.IsValid(port)
+	hasDefaultPort := ports.IsValid(defaultPort)
+
+	switch inputType {
+	case typeFilepath:
+		// if it has ports most likely it's not a file
+		if hasPort {
+			return ""
+		}
+		if filepath.IsAbs(input) {
+			return input
+		}
+		if absPath, _ := filepath.Abs(input); absPath != "" && fileutil.FileOrFolderExists(absPath) {
+			return input
+		}
+		if _, err := filepath.Match(input, ""); err != filepath.ErrBadPattern && !isURL {
+			return input
+		}
+		// if none of these satisfy the condition return empty
+		return ""
+	case typeHostOnly:
+		if hasHost {
+			return host
+		}
+		if isURL && uri != nil {
+			return uri.Hostname()
+		}
+		return input
+	case typeURL:
+		if uri != nil && stringsutil.EqualFoldAny(uri.Scheme, "http", "https") {
+			return input
+		}
+		if h.InputsHTTP != nil {
+			if probed, ok := h.InputsHTTP.Get(input); ok {
+				return string(probed)
+			}
+		}
+		// try to parse it as absolute url and return
+		if absUrl, err := urlutil.ParseAbsoluteURL(input, false); err == nil {
+			return absUrl.String()
+		}
+	case typeHostWithPort, typeHostWithOptionalPort:
+		if hasHost && hasPort {
+			// The network request replaces a reserved port that the scheme
+			// implied, and keeps one the operator typed after a bare host. It
+			// can tell them apart only while the URL keeps its scheme.
+			if isURL && inputType == typeHostWithOptionalPort {
+				return input
+			}
+			return net.JoinHostPort(host, port)
+		}
+		// An optional port is left to the request, which knows the template
+		// port and applies the scheme default only when the template has none.
+		if uri != nil && !hasPort && uri.Scheme == "https" && inputType == typeHostWithPort {
+			// uri.Host keeps the brackets of an IPv6 literal, while
+			// JoinHostPort adds them again, yielding "[[::1]]:443".
+			return net.JoinHostPort(uri.Hostname(), "443")
+		}
+		if hasDefaultPort {
+			// For a URL input the host is the parsed hostname, not the raw
+			// input: JoinHostPort(input, defaultPort) brackets the raw string
+			// (a scheme carries a colon), producing e.g. "[http://example.com]:443",
+			// which is not a usable host:port.
+			if isURL && uri != nil && !hasPort && uri.Hostname() != "" {
+				return net.JoinHostPort(uri.Hostname(), defaultPort)
+			}
+			return net.JoinHostPort(input, defaultPort)
+		}
+		if inputType == typeHostWithOptionalPort {
+			return input
+		}
+	case typeWebsocket:
+		if uri != nil && stringsutil.EqualFoldAny(uri.Scheme, "ws", "wss") {
+			return input
+		}
+		// empty if prefix is not given
+		return ""
+	}
+	// do not return empty
+	return input
+}

@@ -1,0 +1,317 @@
+package output
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/pkg/errors"
+	"github.com/projectdiscovery/goflags"
+	"github.com/projectdiscovery/nuclei/v3/pkg/model"
+	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/json"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/yaml"
+	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
+)
+
+func TestStandardWriterRequest(t *testing.T) {
+	t.Run("WithoutTraceAndError", func(t *testing.T) {
+		w, err := NewStandardWriter(&types.Options{})
+		require.NoError(t, err)
+		require.NotPanics(t, func() {
+			w.Request("path", "input", "http", nil)
+			w.Close()
+		})
+	})
+
+	t.Run("TraceAndErrorWithoutError", func(t *testing.T) {
+		traceWriter := &testWriteCloser{}
+		errorWriter := &testWriteCloser{}
+
+		w, err := NewStandardWriter(&types.Options{})
+		w.traceFile = traceWriter
+		w.errorFile = errorWriter
+		require.NoError(t, err)
+		w.Request("path", "input", "http", nil)
+
+		require.Equal(t, `{"template":"path","type":"http","input":"input","address":"input:","error":"none"}`, traceWriter.String())
+		require.Empty(t, errorWriter.String())
+	})
+
+	t.Run("ErrorWithWrappedError", func(t *testing.T) {
+		errorWriter := &testWriteCloser{}
+
+		w, err := NewStandardWriter(&types.Options{})
+		w.errorFile = errorWriter
+		require.NoError(t, err)
+		w.Request(
+			"misconfiguration/tcpconfig.yaml",
+			"https://example.com/tcpconfig.html",
+			"http",
+			fmt.Errorf("GET https://example.com/tcpconfig.html/tcpconfig.html giving up after 2 attempts: %w", errors.New("context deadline exceeded (Client.Timeout exceeded while awaiting headers)")),
+		)
+
+		require.Equal(t, `{"template":"misconfiguration/tcpconfig.yaml","type":"http","input":"https://example.com/tcpconfig.html","address":"example.com:443","error":"cause=\"context deadline exceeded (Client.Timeout exceeded while awaiting headers)\"","kind":"unknown-error"}`, errorWriter.String())
+	})
+}
+
+// Only the fields filled from a response are redacted; text the template wrote
+// stays as it is, even next to a filled field.
+func TestStandardWriterRedactsFilledInfo(t *testing.T) {
+	w, err := NewStandardWriter(&types.Options{Redact: goflags.StringSlice{"password"}})
+	require.NoError(t, err)
+	w.DisableStdout = true
+
+	written := model.Info{Description: "login with password: {{password}}", Remediation: "Rotate the password: it is public"}
+	filled := &ResultEvent{TemplateInfo: &written, Info: model.Info{Description: "login with password: admin", Remediation: written.Remediation}}
+	static := &ResultEvent{Info: model.Info{Description: "send the password: header"}}
+	require.NoError(t, w.Write(filled))
+	require.NoError(t, w.Write(static))
+
+	require.Equal(t, "login with password: ***", filled.Info.Description)
+	require.Equal(t, "Rotate the password: it is public", filled.Info.Remediation)
+	require.Equal(t, "send the password: header", static.Info.Description)
+}
+
+// Credential headers are masked by default; -no-redact keeps them while keys
+// given with -redact are still masked.
+func TestStandardWriterNoRedact(t *testing.T) {
+	const request = "GET /?tracking=1&x=2 HTTP/1.1\r\nCookie: tracking=1; session=abc\r\nX-Token: secret\r\n\r\n"
+	const response = "HTTP/1.1 200 OK\r\nSet-Cookie: session=abc; Path=/\r\n\r\n"
+	const curl = "curl -H 'Cookie: tracking=1; session=abc' https://example.com/?tracking=1&x=2"
+	const matched = "https://example.com/?tracking=1&x=2"
+
+	cases := []struct {
+		name     string
+		options  *types.Options
+		request  string
+		response string
+		curl     string
+		matched  string
+	}{
+		{
+			"default", &types.Options{},
+			"GET /?tracking=1&x=2 HTTP/1.1\r\nCookie: ***\r\nX-Token: secret\r\n\r\n",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: ***\r\n\r\n",
+			"curl -H 'Cookie: ***' https://example.com/?tracking=1&x=2",
+			matched,
+		},
+		{"no-redact", &types.Options{NoRedact: true}, request, response, curl, matched},
+		{
+			"no-redact with header key", &types.Options{NoRedact: true, Redact: goflags.StringSlice{"X-Token"}},
+			"GET /?tracking=1&x=2 HTTP/1.1\r\nCookie: tracking=1; session=abc\r\nX-Token: ***\r\n\r\n",
+			response, curl, matched,
+		},
+		// One cookie or query parameter is masked; its neighbours stay.
+		{
+			"no-redact with cookie key", &types.Options{NoRedact: true, Redact: goflags.StringSlice{"tracking"}},
+			"GET /?tracking=***&x=2 HTTP/1.1\r\nCookie: tracking=***; session=abc\r\nX-Token: secret\r\n\r\n",
+			response,
+			"curl -H 'Cookie: tracking=***; session=abc' https://example.com/?tracking=***&x=2",
+			"https://example.com/?tracking=***&x=2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, err := NewStandardWriter(tc.options)
+			require.NoError(t, err)
+			w.DisableStdout = true
+
+			event := &ResultEvent{Request: request, Response: response, CURLCommand: curl, Matched: matched}
+			require.NoError(t, w.Write(event))
+
+			require.Equal(t, tc.request, event.Request)
+			require.Equal(t, tc.response, event.Response)
+			require.Equal(t, tc.curl, event.CURLCommand)
+			require.Equal(t, tc.matched, event.Matched)
+		})
+	}
+}
+
+// A `;` inside a query value is part of the value; in a cookie header it is a delimiter.
+func TestRedactKeepsSemicolonInsideValue(t *testing.T) {
+	cases := map[string]string{
+		"GET /?password=;s3cr3t&x=2 HTTP/1.1":             "GET /?password=***&x=2 HTTP/1.1",
+		"GET /?password=a;b HTTP/1.1":                     "GET /?password=*** HTTP/1.1",
+		"GET /?password=super;secret=hidden&x=1 HTTP/1.1": "GET /?password=***&x=1 HTTP/1.1",
+		"https://example.com/?password=a;b":               "https://example.com/?password=***",
+		"https://example.com/?password=a;session=abc":     "https://example.com/?password=***",
+		"Cookie: password=x; session=abc\r\n":             "Cookie: password=***; session=abc\r\n",
+		"Set-Cookie: password=x; Path=/; HttpOnly\r\n":    "Set-Cookie: password=***; Path=/; HttpOnly\r\n",
+		"Set-Cookie: password=x; HttpOnly\r\n":            "Set-Cookie: password=***; HttpOnly\r\n",
+		"password=a;b&user=u":                             "password=***&user=u",
+		"curl -H 'Cookie: password=x; session=abc' 'https://example.com/?password=super;secret=hidden&x=1'": "curl -H 'Cookie: password=***; session=abc' 'https://example.com/?password=***&x=1'",
+	}
+	for in, want := range cases {
+		require.Equal(t, want, redactKeys(in, []string{"password"}), in)
+	}
+}
+
+// The mongo exporter serializes results with bson, which ignores json tags.
+func TestResultEventKeepsTemplateInfoOutOfBSON(t *testing.T) {
+	written := model.Info{Description: "{{host}} is exposed"}
+	data, err := bson.Marshal(&ResultEvent{TemplateInfo: &written, Info: model.Info{Description: "example.com is exposed"}})
+	require.NoError(t, err)
+
+	var doc bson.M
+	require.NoError(t, bson.Unmarshal(data, &doc))
+	require.NotContains(t, doc, "templateinfo")
+	require.Contains(t, doc, "info")
+}
+
+// Template YAML decodes nested maps with interface keys, in the info metadata and
+// in the javascript args a result carries as its metadata.
+func TestFormatJSONNestedYAMLMaps(t *testing.T) {
+	var template struct {
+		Info model.Info             `yaml:"info"`
+		Args map[string]interface{} `yaml:"args"`
+	}
+	err := yaml.Unmarshal([]byte(`
+info:
+  name: Nested metadata
+  author: repro
+  severity: info
+  metadata:
+    labels:
+      en: Hello
+    items:
+      - fr: Bonjour
+args:
+  Nested:
+    en: Hello
+`), &template)
+	require.NoError(t, err)
+
+	w, err := NewStandardWriter(&types.Options{JSONL: true})
+	require.NoError(t, err)
+	data, err := w.formatJSON(&ResultEvent{TemplateID: "nested-metadata", Info: template.Info, Metadata: template.Args})
+	require.NoError(t, err)
+
+	var decoded struct {
+		Info struct {
+			Metadata map[string]interface{} `json:"metadata"`
+		} `json:"info"`
+		Meta map[string]interface{} `json:"meta"`
+	}
+	require.NoError(t, json.Unmarshal(data, &decoded))
+	require.Equal(t, map[string]interface{}{
+		"labels": map[string]interface{}{"en": "Hello"},
+		"items":  []interface{}{map[string]interface{}{"fr": "Bonjour"}},
+	}, decoded.Info.Metadata)
+	require.Equal(t, map[string]interface{}{"Nested": map[string]interface{}{"en": "Hello"}}, decoded.Meta)
+}
+
+// -ms writes failed matches too; an http failure's response follows -rss like
+// an http match's. 0 means no limit, and other protocols don't cut matches.
+func TestWriteFailureTruncatesResponse(t *testing.T) {
+	const response = "HTTP/1.1 200 OK\r\n\r\nresponse body content"
+	tests := []struct {
+		name         string
+		protocol     string
+		saveSize     int
+		wantResponse string
+	}{
+		{"http with -rss", "http", 8, "HTTP/1.1"},
+		{"http without limit", "http", 0, response},
+		{"other protocol", "ssl", 8, response},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, err := NewStandardWriter(&types.Options{JSONL: true, MatcherStatus: true, ResponseSaveSize: tt.saveSize})
+			require.NoError(t, err)
+			outputFile := &testWriteCloser{}
+			w.outputFile = outputFile
+			w.DisableStdout = true
+
+			require.NoError(t, w.WriteFailure(&InternalWrappedEvent{InternalEvent: InternalEvent{
+				"template-id": "no-match",
+				"type":        tt.protocol,
+				"host":        "http://example.com",
+				"response":    response,
+			}}))
+
+			var event struct {
+				Response      string `json:"response"`
+				MatcherStatus bool   `json:"matcher-status"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(outputFile.String())), &event))
+			require.False(t, event.MatcherStatus)
+			require.Equal(t, tt.wantResponse, event.Response)
+		})
+	}
+}
+
+func TestTruncateResponseUTF8AndBinary(t *testing.T) {
+	// "HTTP/1.1 " is 9 bytes; € is 3 bytes (E2 82 AC). Total: 12 bytes.
+	utf8Resp := "HTTP/1.1 €"
+	// Slicing at 10 or 11 cuts €; should back off to 9 bytes.
+	require.Equal(t, "HTTP/1.1 ", truncateResponse(utf8Resp, 10))
+	require.Equal(t, "HTTP/1.1 ", truncateResponse(utf8Resp, 11))
+	require.Equal(t, "HTTP/1.1 €", truncateResponse(utf8Resp, 12))
+
+	// Binary data: non-UTF-8 bytes retain byte-based limit
+	binaryResp := "HTTP/1.1 \x80\x81\x82\x83"
+	require.Equal(t, "HTTP/1.1 \x80\x81", truncateResponse(binaryResp, 11))
+}
+
+func TestWriteTruncatesAfterRedaction(t *testing.T) {
+	// "X-Api-Key: a" (12 bytes) redacts to "X-Api-Key: ***" (14 bytes).
+	// With ResponseSaveSize: 13, the output must not exceed 13 bytes.
+	w, err := NewStandardWriter(&types.Options{JSONL: true, ResponseSaveSize: 13})
+	require.NoError(t, err)
+	outputFile := &testWriteCloser{}
+	w.outputFile = outputFile
+	w.DisableStdout = true
+
+	require.NoError(t, w.Write(&ResultEvent{
+		TemplateID: "test",
+		Type:       "http",
+		Response:   "X-Api-Key: a",
+	}))
+
+	var event struct {
+		Response string `json:"response"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(strings.TrimSpace(outputFile.String())), &event))
+	require.LessOrEqual(t, len(event.Response), 13)
+	require.Equal(t, "X-Api-Key: **", event.Response)
+}
+
+type testWriteCloser struct {
+	strings.Builder
+}
+
+func (w testWriteCloser) Close() error {
+	return nil
+}
+
+
+func TestFormatJSONSanitizesNestedMetadataMaps(t *testing.T) {
+	w, err := NewStandardWriter(&types.Options{})
+	require.NoError(t, err)
+
+	event := &ResultEvent{
+		TemplateID: "nested-metadata",
+		Type:       "file",
+		Host:       "target",
+		Matched:    "target/input.txt",
+		Info: model.Info{
+			Name: "Nested metadata",
+			Metadata: map[string]interface{}{
+				"labels": map[interface{}]interface{}{
+					"en": "Hello",
+					"nested_list": []interface{}{
+						map[interface{}]interface{}{
+							"inner_key": "inner_val",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	data, err := w.formatJSON(event)
+	require.NoError(t, err, "formatJSON should not fail on nested map[interface{}]interface{} (#7971)")
+	require.Contains(t, string(data), `"labels":{"en":"Hello","nested_list":[{"inner_key":"inner_val"}]}`)
+}

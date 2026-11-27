@@ -1,0 +1,306 @@
+package http
+
+import (
+	"bufio"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"io"
+	"net/http"
+	"slices"
+	"strings"
+
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/generators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/utils/httpbody"
+	"github.com/projectdiscovery/rawhttp"
+	"github.com/projectdiscovery/rawhttp/clientpipeline" //nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+	"github.com/projectdiscovery/retryablehttp-go"
+	convUtil "github.com/projectdiscovery/utils/conversion"
+	"github.com/projectdiscovery/utils/errkit"
+	urlutil "github.com/projectdiscovery/utils/url" //nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+)
+
+// maxCurlBodySize is the largest request body included in a curl command.
+// Larger bodies are left out so the command stays readable.
+const maxCurlBodySize = 4 * 1024
+
+// requestDump is a dumped request whose body may be cut short.
+type requestDump struct {
+	// data holds the request line, the headers and at most maxBody bytes
+	// of the body, followed by a truncation marker when cut short.
+	data []byte
+	// truncated is the number of body bytes left out of data.
+	truncated int
+}
+
+// dump creates a dump of the http request in form of a byte slice. Only the
+// first maxBody bytes of the body are kept; maxBody <= 0 keeps all of it.
+func dump(req *generatedRequest, reqURL string, maxBody int) (requestDump, error) {
+	if req.request != nil {
+		dumper := dumpRequest
+		if req.original != nil && req.original.Pipeline {
+			dumper = dumpPipelinedRequest
+		}
+
+		dumped, err := dumper(req.request, maxBody)
+		if err != nil {
+			return requestDump{}, errkit.Wrapf(err, "could not dump request: %v", req.request.String())
+		}
+		return dumped, nil
+	}
+	data := req.rawRequest.Data
+	truncated := 0
+	if maxBody > 0 && len(data) > maxBody {
+		truncated = len(data) - maxBody
+		data = data[:maxBody]
+	}
+	rawHttpOptions := &rawhttp.Options{CustomHeaders: req.rawRequest.UnsafeHeaders, CustomRawBytes: req.rawRequest.UnsafeRawBytes}
+	bin, err := rawhttp.DumpRequestRaw(req.rawRequest.Method, reqURL, req.rawRequest.Path, generators.ExpandMapValues(req.rawRequest.Headers), io.NopCloser(strings.NewReader(data)), rawHttpOptions)
+	if err != nil {
+		return requestDump{}, errkit.Wrapf(err, "could not dump request: %v", reqURL)
+	}
+	// CustomRawBytes are dumped as given, without the body
+	if len(req.rawRequest.UnsafeRawBytes) > 0 {
+		truncated = 0
+	}
+	return requestDump{data: appendTruncationMarker(bin, truncated), truncated: truncated}, nil
+}
+
+// dumpRequest writes req the way http.Transport sends it, as
+// httputil.DumpRequestOut does, but streams the body into a capped buffer
+// instead of copying all of it.
+func dumpRequest(req *retryablehttp.Request, maxBody int) (requestDump, error) {
+	body, err := httpbody.View(req)
+	if err != nil {
+		return requestDump{}, err
+	}
+	// Use a clone to avoid a race condition with the http transport.
+	clone := req.Request.Clone(req.Context())
+	if len(body) == 0 {
+		clone.Body = nil
+		clone.ContentLength = 0
+		delete(clone.Header, "Content-length")
+	} else {
+		clone.Body = httpbody.New(body)
+		clone.ContentLength = int64(len(body))
+	}
+	// http.Transport writes https requests as http over its connection.
+	if clone.URL != nil && clone.URL.Scheme == "https" {
+		clone.URL.Scheme = "http"
+	}
+
+	capture := &cappedWriter{headerEnd: -1, maxBody: maxBody}
+	if maxBody <= 0 {
+		capture.buf = make([]byte, 0, len(body)+dumpHeaderRoom)
+	}
+	if err := clone.Write(capture); err != nil {
+		return requestDump{}, err
+	}
+	data := capture.buf
+	// http.Transport asks for gzip unless the caller set an encoding.
+	if clone.Header.Get("Accept-Encoding") == "" && clone.Header.Get("Range") == "" && clone.Method != http.MethodHead && capture.headerEnd >= 2 {
+		end := capture.headerEnd - 2
+		data = slices.Insert(data, end, acceptEncodingGzip...)
+	}
+	return requestDump{data: appendTruncationMarker(data, capture.dropped), truncated: capture.dropped}, nil
+}
+
+// dumpPipelinedRequest writes req the way the rawhttp pipeline client does.
+// That client does not go through http.Transport: it writes only the method,
+// the path and query, the headers, a Host line and the body, so req.Close,
+// req.ContentLength and the Accept-Encoding that http.Transport adds do not
+// reach the wire.
+func dumpPipelinedRequest(req *retryablehttp.Request, maxBody int) (requestDump, error) {
+	body, err := httpbody.View(req)
+	if err != nil {
+		return requestDump{}, errkit.Wrapf(err, "could not read the request body")
+	}
+
+	piped, err := newPipelinedRequest(req, body)
+	if err != nil {
+		return requestDump{}, err
+	}
+
+	capture := &cappedWriter{buf: nil, headerEnd: -1, maxBody: maxBody, dropped: 0}
+	if maxBody <= 0 {
+		capture.buf = make([]byte, 0, len(body)+dumpHeaderRoom)
+	}
+
+	writer := bufio.NewWriter(capture)
+
+	err = piped.Write(writer)
+	if err != nil {
+		return requestDump{}, errkit.Wrapf(err, "could not write the pipelined request")
+	}
+
+	err = writer.Flush()
+	if err != nil {
+		return requestDump{}, errkit.Wrapf(err, "could not write the pipelined request")
+	}
+
+	return requestDump{data: appendTruncationMarker(capture.buf, capture.dropped), truncated: capture.dropped}, nil
+}
+
+// newPipelinedRequest builds what PipelineClient.Dor passes to the pipeline
+// writer for req. The request target and the Host line come from rawhttp's
+// unexported do, so a change there needs the same change here.
+// TestPipelinedRequestDumpMatchesWire fails when they drift.
+func newPipelinedRequest(req *retryablehttp.Request, body []byte) (*clientpipeline.Request, error) {
+	// req.URL is the URL that Dor parses; req.String() is its String method.
+	target, err := urlutil.ParseURL(req.String(), true)
+	if err != nil {
+		return nil, errkit.Wrapf(err, "could not parse the request URL")
+	}
+
+	path := target.Path
+	if path == "" {
+		path = "/"
+	}
+
+	if !target.Params.IsEmpty() {
+		path += "?" + target.Params.Encode()
+	}
+
+	var reader io.Reader
+	if len(body) > 0 {
+		reader = bytes.NewReader(body)
+	}
+
+	piped := clientpipeline.ToRequest(req.Method, path, nil, req.Header, reader)
+	// The client writes headers in map order. A fixed order keeps the dump
+	// the same between runs.
+	slices.SortStableFunc(piped.Headers, func(a, b clientpipeline.Header) int { return strings.Compare(a.Key, b.Key) })
+
+	if rawhttp.DefaultPipelineOptions.AutomaticHostHeader && target.Host != "" && !hasHeaderFold(req.Header, hostHeader) {
+		piped.Headers = slices.Insert(piped.Headers, 0, clientpipeline.Header{Key: hostHeader, Value: target.Host})
+	}
+
+	return piped, nil
+}
+
+// hasHeaderFold reports whether headers has key in any letter case, as the
+// pipeline client checks for a Host the caller set.
+func hasHeaderFold(headers http.Header, key string) bool {
+	for k := range headers {
+		if strings.EqualFold(k, key) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func appendTruncationMarker(data []byte, truncated int) []byte {
+	if truncated <= 0 {
+		return data
+	}
+	return fmt.Appendf(data, "\n...[truncated %d bytes]", truncated)
+}
+
+// capDumpBody keeps at most maxBody bytes of the body in an already built
+// request dump. maxBody <= 0 keeps the dump unchanged. Saved output and debug
+// use it. Matchers keep the full dump.
+func capDumpBody(dump []byte, maxBody int) []byte {
+	if maxBody <= 0 {
+		return dump
+	}
+	idx := bytes.Index(dump, headerTerminator)
+	if idx < 0 {
+		return dump
+	}
+	headerEnd := idx + len(headerTerminator)
+	bodyLen := len(dump) - headerEnd
+	if bodyLen <= maxBody {
+		return dump
+	}
+	capped := append([]byte(nil), dump[:headerEnd+maxBody]...)
+	return appendTruncationMarker(capped, bodyLen-maxBody)
+}
+
+var headerTerminator = []byte("\r\n\r\n")
+
+const hostHeader = "Host"
+
+var acceptEncodingGzip = []byte("Accept-Encoding: gzip\r\n")
+
+const dumpHeaderRoom = 8 * 1024
+
+// cappedWriter keeps the request line and headers in full and at most
+// maxBody bytes of the body that follows, counting the rest.
+type cappedWriter struct {
+	buf       []byte
+	headerEnd int
+	maxBody   int
+	dropped   int
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	n := len(p)
+	if w.headerEnd < 0 {
+		from := max(len(w.buf)-len(headerTerminator)+1, 0)
+		w.buf = append(w.buf, p...)
+		i := bytes.Index(w.buf[from:], headerTerminator)
+		if i < 0 {
+			return n, nil
+		}
+		w.headerEnd = from + i + len(headerTerminator)
+		// re-apply the cap to body bytes that came with the headers
+		p = bytes.Clone(w.buf[w.headerEnd:])
+		w.buf = w.buf[:w.headerEnd]
+	}
+	keep := len(p)
+	if w.maxBody > 0 {
+		keep = min(keep, max(w.maxBody-(len(w.buf)-w.headerEnd), 0))
+	}
+	w.buf = append(w.buf, p[:keep]...)
+	w.dropped += len(p) - keep
+	return n, nil
+}
+
+// getHTTPProjectCacheScope builds the project file key for a request. A
+// truncated dump does not identify the body, so its hash is added.
+func getHTTPProjectCacheScope(requestDump requestDump, body []byte, scheme, host string) []byte {
+	scheme = strings.ToLower(strings.TrimSpace(scheme))
+	host = strings.ToLower(strings.TrimSpace(host))
+
+	var scoped bytes.Buffer
+	if scheme != "" && host != "" {
+		_, _ = scoped.WriteString(scheme)
+		_, _ = scoped.WriteString("://")
+		_, _ = scoped.WriteString(host)
+		_, _ = scoped.WriteString("\n")
+	}
+	_, _ = scoped.Write(requestDump.data)
+	if requestDump.truncated > 0 {
+		sum := sha256.Sum256(body)
+		_, _ = scoped.WriteString("\nbody-sha256:")
+		_, _ = scoped.WriteString(hex.EncodeToString(sum[:]))
+	}
+	return scoped.Bytes()
+}
+
+func (g *generatedRequest) bodyLen() int64 {
+	if g.rawRequest != nil {
+		return int64(len(g.rawRequest.Data))
+	}
+	if g.request == nil || g.request.Body == nil {
+		return 0
+	}
+	if body, ok := g.request.Body.(*httpbody.Body); ok {
+		return int64(body.Len())
+	}
+	return g.request.ContentLength
+}
+
+// body returns the request body without copying it.
+func (g *generatedRequest) body() []byte {
+	if g.request != nil {
+		body, _ := httpbody.View(g.request)
+		return body
+	}
+	if g.rawRequest != nil {
+		return convUtil.Bytes(g.rawRequest.Data)
+	}
+	return nil
+}

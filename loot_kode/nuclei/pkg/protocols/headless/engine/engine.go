@@ -1,0 +1,268 @@
+package engine
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+
+	"github.com/pkg/errors"
+	"github.com/projectdiscovery/rod"
+	"github.com/projectdiscovery/rod/lib/launcher"
+	"github.com/projectdiscovery/rod/lib/launcher/flags"
+
+	"github.com/projectdiscovery/gologger"
+	"github.com/projectdiscovery/nuclei/v3/pkg/types"
+	fileutil "github.com/projectdiscovery/utils/file"
+	osutils "github.com/projectdiscovery/utils/os"
+)
+
+// Browser is a browser structure for nuclei headless module
+type Browser struct {
+	customAgent    string
+	defaultHeaders map[string]string
+	tempDir        string
+	engine         *rod.Browser
+	options        *types.Options
+	launcher       *launcher.Launcher
+	proxy          *headlessProxy
+
+	// use getHTTPClient to get the http client
+	httpClient     *http.Client
+	httpClientOnce *sync.Once
+
+	// use getScreenshotDir to get the screenshot directory
+	screenshotDir     string
+	screenshotDirErr  error
+	screenshotDirOnce sync.Once
+}
+
+// New creates a new nuclei headless browser module
+func New(options *types.Options) (*Browser, error) {
+	var launcherURL, dataStore string
+	var proxyServer *headlessProxy
+	var err error
+
+	var chromeLauncher *launcher.Launcher
+
+	if options.CDPEndpoint == "" {
+		dataStore, err = os.MkdirTemp("", "nuclei-*")
+		if err != nil {
+			return nil, errors.Wrap(err, "could not create temporary directory")
+		}
+
+		proxyServer, err = newHeadlessProxy(options)
+		if err != nil {
+			return nil, err
+		}
+
+		noSandbox := MustDisableSandbox()
+		chromeLauncher, err = newChromeLauncher(options, dataStore, proxyServer.Addr(), noSandbox)
+		if err != nil {
+			_ = proxyServer.Close()
+			return nil, err
+		}
+
+		launcherURL, err = chromeLauncher.Launch()
+		if err != nil && !noSandbox && !chromeLauncher.Has(flags.NoSandbox) && isSandboxLaunchError(err) {
+			logger := options.Logger
+			if logger == nil {
+				logger = gologger.DefaultLogger
+			}
+			logger.Warning().Msgf("Could not start the browser with its sandbox, starting it without sandbox. To keep the sandbox, allow unprivileged user namespaces (for example sysctl kernel.unprivileged_userns_clone=1 or kernel.apparmor_restrict_unprivileged_userns=0) or in docker use a seccomp profile that allows user namespaces (for example --security-opt seccomp=unconfined): %s", sandboxLine(err.Error()))
+			chromeLauncher.Kill()
+			chromeLauncher, err = newChromeLauncher(options, dataStore, proxyServer.Addr(), true)
+			if err == nil {
+				launcherURL, err = chromeLauncher.Launch()
+			}
+		}
+		if err != nil {
+			_ = proxyServer.Close()
+			return nil, err
+		}
+	} else {
+		launcherURL = options.CDPEndpoint
+	}
+
+	browser := rod.New().ControlURL(launcherURL)
+	if browserErr := browser.Connect(); browserErr != nil {
+		if proxyServer != nil {
+			_ = proxyServer.Close()
+		}
+		return nil, browserErr
+	}
+	defaultHeaders := make(map[string]string)
+	customAgent := ""
+	for _, option := range options.CustomHeaders {
+		parts := strings.SplitN(option, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if strings.EqualFold(parts[0], "User-Agent") {
+			customAgent = parts[1]
+		} else {
+			k := strings.TrimSpace(parts[0])
+			v := strings.TrimSpace(parts[1])
+			if k == "" || v == "" {
+				continue
+			}
+			defaultHeaders[k] = v
+		}
+	}
+
+	engine := &Browser{
+		tempDir:        dataStore,
+		customAgent:    customAgent,
+		defaultHeaders: defaultHeaders,
+		engine:         browser,
+		options:        options,
+		httpClientOnce: &sync.Once{},
+		launcher:       chromeLauncher,
+		proxy:          proxyServer,
+	}
+	return engine, nil
+}
+
+// MustDisableSandbox reports whether the browser must run without its sandbox.
+// Chrome refuses to start sandboxed as root on Linux, so only that case needs
+// "--no-sandbox". Other users keep the sandbox; New falls back to no sandbox
+// with a warning when the system can not provide one.
+// https://github.com/chromium/chromium/blob/c4d3c31083a2e1481253ff2d24298a1dfe19c754/chrome/test/chromedriver/client/chromedriver.py#L209
+func MustDisableSandbox() bool {
+	return mustDisableSandbox(osutils.IsLinux(), os.Geteuid())
+}
+
+func mustDisableSandbox(linux bool, euid int) bool {
+	return linux && euid == 0
+}
+
+// newChromeLauncher returns the launcher for a local browser. User headless
+// options are applied last, so "-headless-options no-sandbox" still works.
+func newChromeLauncher(options *types.Options, dataStore, proxyAddr string, noSandbox bool) (*launcher.Launcher, error) {
+	chromeLauncher := launcher.New().
+		Leakless(false).
+		Set("disable-crash-reporter").
+		Set("disable-gpu").
+		Set("disable-notifications").
+		Set("hide-scrollbars").
+		Set("ignore-certificate-errors").
+		Set("ignore-ssl-errors").
+		Set("incognito").
+		Set("mute-audio").
+		Set("window-size", fmt.Sprintf("%d,%d", 1080, 1920)).
+		Delete("use-mock-keychain").
+		UserDataDir(dataStore).
+		// rod adds "--no-sandbox" by default inside containers, so the
+		// sandbox is always set explicitly.
+		NoSandbox(noSandbox)
+
+	executablePath, err := os.Executable()
+	if err != nil {
+		return nil, err
+	}
+
+	// if musl is used, most likely we are on alpine linux which is not supported by go-rod, so we fallback to default chrome
+	useMusl, _ := fileutil.UseMusl(executablePath)
+	if options.UseInstalledChrome || useMusl {
+		if chromePath, hasChrome := launcher.LookPath(); hasChrome {
+			chromeLauncher.Bin(chromePath)
+		} else {
+			return nil, errors.New("the chrome browser is not installed")
+		}
+	}
+
+	chromeLauncher = chromeLauncher.
+		Headless(!options.ShowBrowser).
+		Proxy(proxyAddr).
+		Set("proxy-bypass-list", "<-loopback>")
+
+	for k, v := range options.ParseHeadlessOptionalArguments() {
+		chromeLauncher.Set(flags.Flag(k), v)
+	}
+	return chromeLauncher, nil
+}
+
+// isSandboxLaunchError reports whether the browser exited because its
+// sandbox could not be set up, for example "No usable sandbox!".
+func isSandboxLaunchError(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "sandbox")
+}
+
+// sandboxLine returns the browser output line about the sandbox.
+func sandboxLine(value string) string {
+	for _, line := range strings.Split(value, "\n") {
+		if strings.Contains(strings.ToLower(line), "sandbox") {
+			return strings.TrimSpace(line)
+		}
+	}
+	return strings.TrimSpace(value)
+}
+
+// SetUserAgent sets custom user agent to the browser
+func (b *Browser) SetUserAgent(customUserAgent string) {
+	b.customAgent = customUserAgent
+}
+
+// UserAgent fetch the currently set custom user agent
+func (b *Browser) UserAgent() string {
+	return b.customAgent
+}
+
+// applyDefaultHeaders setsheaders passed via cli -H flag
+func (b *Browser) applyDefaultHeaders(p *rod.Page) error {
+	pairs := make([]string, 0, len(b.defaultHeaders)*2+2)
+
+	hasAcceptLanguage := false
+	for k := range b.defaultHeaders {
+		if strings.EqualFold(k, "Accept-Language") {
+			hasAcceptLanguage = true
+			break
+		}
+	}
+	if !hasAcceptLanguage {
+		pairs = append(pairs, "Accept-Language", "en, en-GB, en-us;")
+	}
+	for k, v := range b.defaultHeaders {
+		pairs = append(pairs, k, v)
+	}
+	if len(pairs) == 0 {
+		return nil
+	}
+	_, err := p.SetExtraHeaders(pairs)
+	return err
+}
+
+func (b *Browser) getHTTPClient() (*http.Client, error) {
+	var err error
+	b.httpClientOnce.Do(func() {
+		b.httpClient, err = newHttpClient(b.options)
+	})
+	return b.httpClient, err
+}
+
+// getScreenshotDir returns the directory that holds the screenshots of
+// templates when local file access is off. It is created once per browser
+// and kept after Close, so the screenshots stay available.
+func (b *Browser) getScreenshotDir() (string, error) {
+	b.screenshotDirOnce.Do(func() {
+		b.screenshotDir, b.screenshotDirErr = os.MkdirTemp("", "nuclei-screenshots-*")
+	})
+	return b.screenshotDir, b.screenshotDirErr
+}
+
+// Close closes the browser engine
+//
+// When connected over CDP, it does NOT close the browsers.
+func (b *Browser) Close() {
+	if b.proxy != nil {
+		_ = b.proxy.Close()
+	}
+	if b.options.CDPEndpoint != "" {
+		return
+	}
+
+	_ = b.engine.Close()
+	b.launcher.Kill()
+	_ = os.RemoveAll(b.tempDir)
+}

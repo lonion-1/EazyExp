@@ -1,0 +1,2839 @@
+package http
+
+import (
+	"cmp"
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/tarunKoyalwar/goleak"
+
+	"github.com/projectdiscovery/nuclei/v3/internal/tests/testutils"
+	"github.com/projectdiscovery/nuclei/v3/pkg/model"
+	"github.com/projectdiscovery/nuclei/v3/pkg/model/types/severity"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators/extractors"
+	"github.com/projectdiscovery/nuclei/v3/pkg/operators/matchers"
+	"github.com/projectdiscovery/nuclei/v3/pkg/output"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/contextargs"
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/hosterrorscache" //nolint:depguard // No depguard rules are configured, so its default list allows only the standard library.
+	"github.com/projectdiscovery/nuclei/v3/pkg/protocols/common/interactsh"
+	"github.com/projectdiscovery/ratelimit"
+	"github.com/projectdiscovery/retryablehttp-go"
+)
+
+func executeDynamicHTTPTestRequest(t *testing.T, request *Request, target string) {
+	t.Helper()
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+	require.NoError(t, request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), target),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	))
+}
+
+func TestHTTPExtractMultipleReuse(t *testing.T) {
+	options := testutils.DefaultOptions
+
+	testutils.Init(options)
+	templateID := "testing-http"
+	request := &Request{
+		ID: templateID,
+		Raw: []string{
+			`GET /robots.txt HTTP/1.1
+			Host: {{Hostname}}
+			User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:80.0) Gecko/20100101 Firefox/80.0
+			Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+			Accept-Language: en-US,en;q=0.5
+			`,
+
+			`GET {{endpoint}} HTTP/1.1
+			Host: {{Hostname}}
+			User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:80.0) Gecko/20100101 Firefox/80.0
+			Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+			Accept-Language: en-US,en;q=0.5
+			`,
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"match /a", "match /b", "match /c"},
+			}},
+			Extractors: []*extractors.Extractor{{
+				Part:     "body",
+				Name:     "endpoint",
+				Type:     extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+				Regex:    []string{"(?m)/([a-zA-Z0-9-_/\\\\]+)"},
+				Internal: true,
+			}},
+		},
+		IterateAll: true,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			_, _ = fmt.Fprintf(w, `User-agent: Googlebot
+Disallow: /a
+Disallow: /b
+Disallow: /c`)
+		default:
+			_, _ = fmt.Fprintf(w, `match %v`, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+
+	err := request.Compile(executerOpts)
+	require.Nil(t, err, "could not compile network request")
+
+	var finalEvent *output.InternalWrappedEvent
+	var matchCount int
+	t.Run("test", func(t *testing.T) {
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+		err := request.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matchCount++
+			}
+			finalEvent = event
+		})
+		require.Nil(t, err, "could not execute network request")
+	})
+	require.NotNil(t, finalEvent, "could not get event output from request")
+	require.Equal(t, 3, matchCount, "could not get correct match count")
+}
+
+func TestHTTPExtractMultipleReusePreservesBranchValues(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	request := &Request{
+		ID: "testing-http-branch-values",
+		Raw: []string{
+			"GET /capabilities HTTP/1.1\nHost: {{Hostname}}",
+			"GET /metadata/{{name}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /probe/{{name}}/{{column}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{
+			Extractors: []*extractors.Extractor{
+				{
+					Part:       "body_1",
+					Name:       "name",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`name=([a-z]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+				{
+					Part:       "body_2",
+					Name:       "column",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`column=([a-z0-9]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+			},
+		},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	probes := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/capabilities":
+			_, _ = fmt.Fprint(w, "name=alpha name=beta")
+		case "/metadata/alpha":
+			_, _ = fmt.Fprint(w, "column=a1 column=a2")
+		case "/metadata/beta":
+			_, _ = fmt.Fprint(w, "column=b1")
+		default:
+			mutex.Lock()
+			probes[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), ts.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{
+		"/probe/alpha/a1": 1,
+		"/probe/alpha/a2": 1,
+		"/probe/beta/b1":  1,
+	}, probes)
+}
+
+func TestHTTPExtractMultipleReuseReplacesReextractedValue(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	request := &Request{
+		ID: "testing-http-reextracted-value",
+		Raw: []string{
+			"GET /session HTTP/1.1\nHost: {{Hostname}}",
+			"GET /refresh/{{token}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{token}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /final/{{token}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{
+			Extractors: []*extractors.Extractor{
+				{
+					Part:       "body_1",
+					Name:       "token",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`token=([a-z]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+				{
+					Part:       "body_2",
+					Name:       "token",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`token=([a-z]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+			},
+		},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	requests := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		requests[r.URL.Path]++
+		mutex.Unlock()
+		switch r.URL.Path {
+		case "/session":
+			_, _ = fmt.Fprint(w, "token=old")
+		case "/refresh/old":
+			_, _ = fmt.Fprint(w, "token=new token=next")
+		}
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), ts.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{
+		"/session":     1,
+		"/refresh/old": 1,
+		"/use/new":     1,
+		"/use/next":    1,
+		"/final/new":   1,
+		"/final/next":  1,
+	}, requests)
+}
+
+func TestExpandDynamicValueContextsReplacesReextractedValueWithoutIteration(t *testing.T) {
+	parent := dynamicValueContext{
+		values: map[string]interface{}{"token": "old"},
+	}
+
+	contexts := expandDynamicValueContexts(parent, map[string][]string{"token": {"new", "next"}}, false)
+
+	require.Len(t, contexts, 1)
+	require.Equal(t, "new", contexts[0].values["token"])
+}
+
+func TestHTTPExtractMultipleReusePreservesOnceValuesAcrossPayloads(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	request := &Request{
+		ID: "testing-http-once-payload-values",
+		Raw: []string{
+			"@once\nGET /token HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{token}}/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Payloads: map[string]interface{}{
+			"item": []string{"first", "second"},
+		},
+		Operators: operators.Operators{
+			Extractors: []*extractors.Extractor{{
+				Part:       "body_1",
+				Name:       "token",
+				Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+				Regex:      []string{`token=([a-z]+)`},
+				RegexGroup: 1,
+				Internal:   true,
+			}},
+		},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	requests := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			_, _ = fmt.Fprint(w, "token=shared")
+			return
+		}
+		mutex.Lock()
+		requests[r.URL.Path]++
+		mutex.Unlock()
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), ts.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{
+		"/use/shared/first":  1,
+		"/use/shared/second": 1,
+	}, requests)
+}
+
+func TestHTTPExtractMultipleReuseDoesNotPersistPayloadValuesBeforeOnce(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	request := &Request{
+		ID: "testing-http-payload-values-before-once",
+		Raw: []string{
+			"GET /seed/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+			"@once\nGET /token HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{branch}}/{{token}}/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Payloads: map[string]interface{}{
+			"item": []string{"first", "second"},
+		},
+		Operators: operators.Operators{
+			Extractors: []*extractors.Extractor{
+				{
+					Part:       "body_1",
+					Name:       "branch",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`branch=([a-z]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+				{
+					Part:       "body_2",
+					Name:       "token",
+					Type:       extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor},
+					Regex:      []string{`token=([a-z]+)`},
+					RegexGroup: 1,
+					Internal:   true,
+				},
+			},
+		},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	requests := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/seed/"):
+			_, _ = fmt.Fprintf(w, "branch=%s", strings.TrimPrefix(r.URL.Path, "/seed/"))
+		case r.URL.Path == "/token":
+			_, _ = fmt.Fprint(w, "token=shared")
+		default:
+			mutex.Lock()
+			requests[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), ts.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+	require.Equal(t, map[string]int{
+		"/use/first/shared/first":   1,
+		"/use/second/shared/second": 1,
+	}, requests)
+}
+
+func TestHTTPExtractMultipleReuseSkipsOnlyMissingBranch(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-missing-branch",
+		Raw: []string{
+			"GET /capabilities HTTP/1.1\nHost: {{Hostname}}",
+			"GET /metadata/{{name}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /probe/{{name}}/{{column}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{
+			{Part: "body_1", Name: "name", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`name=([a-z]+)`}, RegexGroup: 1, Internal: true},
+			{Part: "body_2", Name: "column", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`column=([a-z0-9]+)`}, RegexGroup: 1, Internal: true},
+		}},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	probes := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/capabilities":
+			_, _ = fmt.Fprint(w, "name=alpha name=beta name=gamma")
+		case "/metadata/beta":
+			_, _ = fmt.Fprint(w, "column=b1")
+		case "/metadata/gamma":
+			_, _ = fmt.Fprint(w, "column=g1")
+		case "/metadata/alpha":
+		default:
+			mutex.Lock()
+			probes[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/probe/beta/b1": 1, "/probe/gamma/g1": 1}, probes)
+}
+
+func TestHTTPExtractMultipleReuseKeepsPayloadFallback(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-payload-fallback",
+		Raw: []string{
+			"GET /create HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{rid}}/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Payloads: map[string]interface{}{"item": []string{"p1", "p2", "p3"}},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body", Name: "rid", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`rid=([a-z]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+		IterateAll: true,
+	}
+
+	var createCount atomic.Int32
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/create" {
+			if createCount.Add(1) == 1 {
+				_, _ = fmt.Fprint(w, "rid=abc")
+			}
+			return
+		}
+		mutex.Lock()
+		uses[r.URL.Path]++
+		mutex.Unlock()
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/use/abc/p1": 1, "/use/abc/p2": 1, "/use/abc/p3": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseUsesLatestReextractedValue(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-latest-reextracted-value",
+		Raw: []string{
+			"GET /one HTTP/1.1\nHost: {{Hostname}}",
+			"GET /two HTTP/1.1\nHost: {{Hostname}}",
+			"GET /three HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{csrf}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body", Name: "csrf", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`csrf=([a-z]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+	}
+
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/one":
+			_, _ = fmt.Fprint(w, "csrf=aaa")
+		case "/two":
+			_, _ = fmt.Fprint(w, "csrf=bbb")
+		case "/three":
+			_, _ = fmt.Fprint(w, "csrf=aaa")
+		default:
+			mutex.Lock()
+			uses[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/use/aaa": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseRetainsParentValueWhenReextracted(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-parent-reextracted-value",
+		Raw: []string{
+			"GET /items HTTP/1.1\nHost: {{Hostname}}",
+			"GET /item/{{id}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /delete/{{id}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body", Name: "id", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`id=([0-9]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	deletes := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/items":
+			_, _ = fmt.Fprint(w, "id=1 id=2")
+		case "/item/1":
+			_, _ = fmt.Fprint(w, "id=1 id=9")
+		case "/item/2":
+			_, _ = fmt.Fprint(w, "id=2")
+		default:
+			mutex.Lock()
+			deletes[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/delete/1": 1, "/delete/2": 1, "/delete/9": 1}, deletes)
+}
+
+func TestHTTPExtractMultipleReuseRunsOnceRequestOnceAcrossBranches(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-once-across-branches",
+		Raw: []string{
+			"GET /list HTTP/1.1\nHost: {{Hostname}}",
+			"@once\nGET /token HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{id}}/{{token}}/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Payloads: map[string]interface{}{"item": []string{"x", "y", "z"}},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{
+			{Part: "body_1", Name: "id", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`id=([a-z]+)`}, RegexGroup: 1, Internal: true},
+			{Part: "body_2", Name: "token", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`token=([a-z0-9]+)`}, RegexGroup: 1, Internal: true},
+		}},
+		IterateAll: true,
+	}
+
+	var tokenCount atomic.Int32
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/list":
+			_, _ = fmt.Fprint(w, "id=a id=b")
+		case "/token":
+			_, _ = fmt.Fprintf(w, "token=t%d", tokenCount.Add(1))
+		default:
+			mutex.Lock()
+			uses[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.EqualValues(t, 1, tokenCount.Load())
+	require.Equal(t, map[string]int{
+		"/use/a/t1/x": 1, "/use/b/t1/x": 1,
+		"/use/a/t1/y": 1, "/use/b/t1/y": 1,
+		"/use/a/t1/z": 1, "/use/b/t1/z": 1,
+	}, uses)
+}
+
+func TestHTTPExtractMultipleReuseKeepsResponseHistoryPerBranch(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-branch-response-history",
+		Raw: []string{
+			"GET /items HTTP/1.1\nHost: {{Hostname}}",
+			"GET /item/{{id}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /noop/{{id}} HTTP/1.1\nHost: {{Hostname}}",
+			"GET /use/{{id}}/{{token}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{
+			{Part: "body_1", Name: "id", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`id=([a-z]+)`}, RegexGroup: 1, Internal: true},
+			{Part: "body_2", Name: "token", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`token=([a-z]+)`}, RegexGroup: 1, Internal: true},
+		}},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/items":
+			_, _ = fmt.Fprint(w, "id=a id=b")
+		case "/item/a":
+			_, _ = fmt.Fprint(w, "token=a")
+		case "/item/b":
+			_, _ = fmt.Fprint(w, "token=b")
+		case "/noop/a", "/noop/b":
+		default:
+			mutex.Lock()
+			uses[r.URL.Path]++
+			mutex.Unlock()
+		}
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/use/a/a": 1, "/use/b/b": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseCopiesRenderedPayloadPerBranch(t *testing.T) {
+	request := &Request{
+		ID: "testing-http-payload-per-branch",
+		Raw: []string{
+			"GET /names HTTP/1.1\nHost: {{Hostname}}",
+			"GET /x/{{item}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Payloads: map[string]interface{}{"item": []string{"{{name}}-p"}},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body_1", Name: "name", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`name=([a-z]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/names" {
+			_, _ = fmt.Fprint(w, "name=alpha name=beta")
+			return
+		}
+		mutex.Lock()
+		uses[r.URL.Path]++
+		mutex.Unlock()
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.Equal(t, map[string]int{"/x/alpha-p": 1, "/x/beta-p": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseDeduplicatesNewValues(t *testing.T) {
+	request := &Request{
+		ID:  "testing-http-deduplicate-values",
+		Raw: []string{"GET /seed HTTP/1.1\nHost: {{Hostname}}", "GET /use/{{v}} HTTP/1.1\nHost: {{Hostname}}"},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{
+			{Part: "body", Name: "v", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`value=([a-z]+)`}, RegexGroup: 1, Internal: true},
+			{Part: "header", Name: "v", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`X-Value: ([a-z]+)`}, RegexGroup: 1, Internal: true},
+		}},
+		IterateAll: true,
+	}
+
+	var useCount atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/seed" {
+			w.Header().Set("X-Value", "abc")
+			_, _ = fmt.Fprint(w, "value=abc")
+			return
+		}
+		useCount.Add(1)
+	}))
+	defer ts.Close()
+
+	executeDynamicHTTPTestRequest(t, request, ts.URL)
+	require.EqualValues(t, 1, useCount.Load())
+}
+
+func TestHTTPExtractMultipleReuseOverridesTemplateContextPerBranch(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+	request := &Request{
+		ID:  "testing-http-template-context-branch",
+		Raw: []string{"GET /seed HTTP/1.1\nHost: {{Hostname}}", "GET /use/{{id}} HTTP/1.1\nHost: {{Hostname}}"},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body_1", Name: "id", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`id=([a-z]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/seed" {
+			_, _ = fmt.Fprint(w, "id=alpha id=beta")
+			return
+		}
+		mutex.Lock()
+		uses[r.URL.Path]++
+		mutex.Unlock()
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+	input := contextargs.NewWithInput(context.Background(), ts.URL)
+	executerOpts.GetTemplateCtx(input.MetaInput).Set("id", "stale")
+	require.NoError(t, request.ExecuteWithResults(
+		input,
+		output.InternalEvent(executerOpts.GetTemplateCtx(input.MetaInput).GetAll()),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	))
+	require.Equal(t, map[string]int{"/use/alpha": 1, "/use/beta": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseIteratesInitialDynamicValues(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+	request := &Request{
+		ID:         "testing-http-initial-dynamic-values",
+		Raw:        []string{"GET /use/{{id}} HTTP/1.1\nHost: {{Hostname}}"},
+		IterateAll: true,
+	}
+
+	var mutex sync.Mutex
+	uses := make(map[string]int)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mutex.Lock()
+		uses[r.URL.Path]++
+		mutex.Unlock()
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+	require.NoError(t, request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), ts.URL),
+		output.InternalEvent{"id": []string{"alpha", "beta"}},
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	))
+	require.Equal(t, map[string]int{"/use/alpha": 1, "/use/beta": 1}, uses)
+}
+
+func TestHTTPExtractMultipleReuseStopsOnceBranchesAfterCancellation(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+	request := &Request{
+		ID: "testing-http-once-branch-cancellation",
+		Raw: []string{
+			"GET /seed HTTP/1.1\nHost: {{Hostname}}",
+			"@once\nGET /token/{{missing}} HTTP/1.1\nHost: {{Hostname}}",
+		},
+		Operators: operators.Operators{Extractors: []*extractors.Extractor{{
+			Part: "body_1", Name: "id", Type: extractors.ExtractorTypeHolder{ExtractorType: extractors.RegexExtractor}, Regex: []string{`id=([a-z]+)`}, RegexGroup: 1, Internal: true,
+		}}},
+		IterateAll: true,
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "id=alpha id=beta")
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID: request.ID,
+		Info: model.Info{
+			SeverityHolder: severity.Holder{Severity: severity.Low},
+			Name:           "test",
+		},
+	})
+	executerOpts.RateLimiter.Stop()
+	executerOpts.RateLimiter = ratelimit.New(context.Background(), 1, 500*time.Millisecond)
+	t.Cleanup(executerOpts.RateLimiter.Stop)
+	require.NoError(t, request.Compile(executerOpts))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancelTimer := time.AfterFunc(100*time.Millisecond, cancel)
+	t.Cleanup(func() {
+		cancelTimer.Stop()
+		cancel()
+	})
+	startedAt := time.Now()
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(ctx, ts.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, time.Since(startedAt), 750*time.Millisecond)
+}
+
+// A request's timeout bounds its exchange with the host. The wait for a
+// rate-limit token comes before that, so a paced request must still be sent
+// (#8162, #8176).
+//
+//nolint:paralleltest // the cases share the protocol state testutils.Init sets up
+func TestRequestTimeoutStartsAfterRateLimitWait(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  []string
+	}{
+		{
+			name: "default timeout",
+			raw: []string{
+				"GET /first HTTP/1.1\nHost: {{Hostname}}",
+				"GET /second HTTP/1.1\nHost: {{Hostname}}",
+			},
+		},
+		{
+			name: "timeout annotation",
+			raw: []string{
+				"@timeout: 500ms\nGET /first HTTP/1.1\nHost: {{Hostname}}",
+				"@timeout: 500ms\nGET /second HTTP/1.1\nHost: {{Hostname}}",
+			},
+		},
+		{
+			// An annotation on one request turns off the client timeout for
+			// all of them, so the other request takes the default timeout.
+			name: "request beside a timeout annotation",
+			raw: []string{
+				"@timeout: 500ms\nGET /first HTTP/1.1\nHost: {{Hostname}}",
+				"GET /second HTTP/1.1\nHost: {{Hostname}}",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := &Request{Raw: tt.raw} //nolint:exhaustruct,exhaustruct_v5 // zero values are the template defaults
+			require.Equal(t, []string{"/first", "/second"}, executePacedRequests(t, request))
+		})
+	}
+}
+
+// The parallel path builds each request before a worker takes its rate-limit
+// token, so the timeout has to start after that wait as well (#8176).
+//
+//nolint:paralleltest // shares the protocol state testutils.Init sets up
+func TestParallelRequestTimeoutStartsAfterRateLimitWait(t *testing.T) {
+	//nolint:exhaustruct,exhaustruct_v5 // zero values are the template defaults
+	request := &Request{
+		Raw:      []string{"@timeout: 500ms\nGET /{{path}} HTTP/1.1\nHost: {{Hostname}}"},
+		Threads:  1,
+		Payloads: map[string]any{"path": []string{"first", "second"}},
+	}
+	require.Equal(t, []string{"/first", "/second"}, executePacedRequests(t, request))
+}
+
+// With @timeout the client has no overall timeout of its own, so the request's
+// deadline bounds reading the response. A valid annotation sets it on every
+// path; one that does not parse or is not positive keeps the default (#8176).
+//
+//nolint:paralleltest // the cases share the protocol state testutils.Init sets up
+func TestTimeoutAnnotationBoundsResponse(t *testing.T) {
+	const stall = 2 * time.Second
+
+	tests := []struct {
+		name        string
+		annotation  string
+		httpTimeout time.Duration
+		parallel    bool
+	}{
+		{name: "annotation, sequential", annotation: "300ms", httpTimeout: time.Minute, parallel: false},
+		{name: "annotation, parallel", annotation: "300ms", httpTimeout: time.Minute, parallel: true},
+		{name: "unparsable annotation, parallel", annotation: "soon", httpTimeout: 300 * time.Millisecond, parallel: true},
+		{name: "zero annotation, parallel", annotation: "0s", httpTimeout: 300 * time.Millisecond, parallel: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := testutils.DefaultOptions.Copy()
+			timeouts := *options.GetTimeouts()
+			timeouts.HttpTimeout = test.httpTimeout
+			options.SetTimeouts(&timeouts)
+			testutils.Init(options)
+			t.Cleanup(func() { testutils.Cleanup(options) })
+
+			// The headers arrive at once and the body stalls, so only the
+			// request's deadline can end the read before the stall does.
+			server := httptest.NewServer(http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+				resp.Header().Set("Content-Length", "2")
+				resp.WriteHeader(http.StatusOK)
+				_ = http.NewResponseController(resp).Flush()
+
+				select {
+				case <-req.Context().Done():
+				case <-time.After(stall):
+					_, _ = resp.Write([]byte("ok"))
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			//nolint:exhaustruct,exhaustruct_v5 // zero values are the template defaults
+			request := &Request{Raw: []string{"@timeout: " + test.annotation + "\nGET / HTTP/1.1\nHost: {{Hostname}}"}}
+			if test.parallel {
+				request.Raw = []string{"@timeout: " + test.annotation + "\nGET /?p={{p}} HTTP/1.1\nHost: {{Hostname}}"}
+				request.Threads = 1
+				request.Payloads = map[string]any{"p": []string{"a"}}
+			}
+
+			require.NoError(t, request.Compile(testutils.NewMockExecuterOptions(options, nil)))
+
+			start := time.Now()
+			err := request.ExecuteWithResults(contextargs.NewWithInput(t.Context(), server.URL),
+				make(output.InternalEvent), make(output.InternalEvent), func(*output.InternalWrappedEvent) {})
+			require.Error(t, err)
+			require.Less(t, time.Since(start), stall, "the response was read past the request's timeout")
+		})
+	}
+}
+
+// A template with a raw @timeout turns off the client timeout for all of its
+// requests. A parallel request without an annotation must still get the HTTP
+// timeout once it is sent, as the sequential path gives it.
+//
+//nolint:paralleltest // shares the protocol state testutils.Init sets up
+func TestParallelRequestGetsDefaultTimeoutWithoutClientTimeout(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	timeouts := *options.GetTimeouts()
+	timeouts.HttpTimeout = 300 * time.Millisecond
+	options.SetTimeouts(&timeouts)
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(2 * time.Second)
+		_, _ = w.Write([]byte("late"))
+	}))
+	t.Cleanup(server.Close)
+
+	//nolint:exhaustruct,exhaustruct_v5 // zero values are the template defaults
+	request := &Request{
+		Path:     []string{"{{BaseURL}}/{{p}}"},
+		Threads:  2,
+		Payloads: map[string]any{"p": []string{"a", "b"}},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, nil)
+	require.NoError(t, request.Compile(executerOpts))
+	request.connConfiguration.NoTimeout = true
+
+	start := time.Now()
+	_ = request.ExecuteWithResults(
+		contextargs.NewWithInput(t.Context(), server.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.Less(t, time.Since(start), 1500*time.Millisecond, "requests waited out the server's 2s reply")
+}
+
+// Canceling the scan must stop a request of a template that uses @timeout,
+// whether the request has the annotation or takes the default timeout because
+// another request of the template does (#8178).
+//
+//nolint:paralleltest // the cases share the protocol state testutils.Init sets up
+func TestTimeoutAnnotationKeepsScanCancellation(t *testing.T) {
+	const answerAfter = 5 * time.Second
+
+	tests := []struct {
+		name string
+		raw  []string
+	}{
+		{name: "annotated", raw: []string{"@timeout: 30s\nGET / HTTP/1.1\nHost: {{Hostname}}"}},
+		{name: "default timeout", raw: []string{
+			"GET / HTTP/1.1\nHost: {{Hostname}}",
+			"@timeout: 30s\nGET /next HTTP/1.1\nHost: {{Hostname}}",
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			options := testutils.DefaultOptions.Copy()
+			timeouts := *options.GetTimeouts()
+			timeouts.HttpTimeout = time.Minute
+			options.SetTimeouts(&timeouts)
+			testutils.Init(options)
+			t.Cleanup(func() { testutils.Cleanup(options) })
+
+			server := httptest.NewServer(http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {
+				select {
+				case <-req.Context().Done():
+				case <-time.After(answerAfter):
+					_, _ = resp.Write([]byte("done"))
+				}
+			}))
+			t.Cleanup(server.Close)
+
+			//nolint:exhaustruct,exhaustruct_v5 // zero values are the template defaults
+			request := &Request{
+				Raw: test.raw,
+				Matchers: []*matchers.Matcher{{
+					Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+					Words: []string{"done"},
+				}},
+			}
+			require.NoError(t, request.Compile(testutils.NewMockExecuterOptions(options, nil)))
+
+			ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+			defer cancel()
+
+			var matched atomic.Bool
+
+			start := time.Now()
+			_ = request.ExecuteWithResults(contextargs.NewWithInput(ctx, server.URL),
+				make(output.InternalEvent), make(output.InternalEvent), func(event *output.InternalWrappedEvent) {
+					if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+						matched.Store(true)
+					}
+				})
+
+			require.Less(t, time.Since(start), answerAfter/2, "the request outlived the canceled scan")
+			require.False(t, matched.Load(), "a canceled scan reported a match")
+		})
+	}
+}
+
+// executePacedRequests runs request with a 500ms HTTP timeout and a rate limit
+// of one token every 800ms, so the second request waits past its timeout. It
+// returns the paths the server received.
+func executePacedRequests(t *testing.T, request *Request) []string {
+	t.Helper()
+
+	options := testutils.DefaultOptions.Copy()
+	timeouts := *options.GetTimeouts()
+	timeouts.HttpTimeout = 500 * time.Millisecond
+	options.SetTimeouts(&timeouts)
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+
+	var (
+		pathsMu sync.Mutex
+		paths   []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		pathsMu.Lock()
+		defer pathsMu.Unlock()
+
+		paths = append(paths, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	executerOpts := testutils.NewMockExecuterOptions(options, nil)
+	require.NoError(t, request.Compile(executerOpts))
+
+	executerOpts.RateLimiter.Stop()
+	executerOpts.RateLimiter = ratelimit.New(t.Context(), 1, 800*time.Millisecond)
+	t.Cleanup(executerOpts.RateLimiter.Stop)
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(t.Context(), server.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+
+	pathsMu.Lock()
+	defer pathsMu.Unlock()
+
+	return slices.Clone(paths)
+}
+
+func TestRequestMatcherSeesBodyPastSaveSize(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.RequestSaveSize = 32
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+
+	marker := "TAILMARKER"
+	request := &Request{
+		ID:     "request-save-size",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPPost},
+		Path:   []string{"{{BaseURL}}"},
+		Body:   strings.Repeat("A", 200) + marker,
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "request",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{marker},
+			}},
+		},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	var event *output.InternalWrappedEvent
+	err := request.ExecuteWithResults(contextargs.NewWithInput(context.Background(), ts.URL), make(output.InternalEvent), make(output.InternalEvent), func(got *output.InternalWrappedEvent) {
+		if got.OperatorsResult != nil && got.OperatorsResult.Matched {
+			event = got
+		}
+	})
+	require.NoError(t, err)
+	require.NotNil(t, event)
+	require.Contains(t, event.InternalEvent["request"], marker)
+	require.NotEmpty(t, event.Results)
+	require.NotContains(t, event.Results[0].Request, marker)
+	require.Contains(t, event.Results[0].Request, "truncated")
+}
+
+func TestDisableTE(t *testing.T) {
+	options := testutils.DefaultOptions
+
+	testutils.Init(options)
+	templateID := "http-disable-transfer-encoding"
+
+	// in raw request format
+	request := &Request{
+		ID: templateID,
+		Raw: []string{
+			`POST / HTTP/1.1
+			Host: {{Hostname}}
+			User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:80.0) Gecko/20100101 Firefox/80.0
+			Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+			Accept-Language: en-US,en;q=0.5
+
+			login=1&username=admin&password=admin
+			`,
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Type:   matchers.MatcherTypeHolder{MatcherType: matchers.StatusMatcher},
+				Status: []int{200},
+			}},
+		},
+	}
+
+	// in base request format
+	request2 := &Request{
+		ID:     templateID,
+		Method: HTTPMethodTypeHolder{MethodType: HTTPPost},
+		Path:   []string{"{{BaseURL}}"},
+		Body:   "login=1&username=admin&password=admin",
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Type:   matchers.MatcherTypeHolder{MatcherType: matchers.StatusMatcher},
+				Status: []int{200},
+			}},
+		},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if len(r.TransferEncoding) > 0 || r.ContentLength <= 0 {
+			t.Error("Transfer-Encoding header should not be set")
+		}
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+
+	err := request.Compile(executerOpts)
+	require.Nil(t, err, "could not compile http raw request")
+
+	err = request2.Compile(executerOpts)
+	require.Nil(t, err, "could not compile http base request")
+
+	var finalEvent *output.InternalWrappedEvent
+	var matchCount int
+	t.Run("test", func(t *testing.T) {
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+		err := request.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matchCount++
+			}
+			finalEvent = event
+		})
+		require.Nil(t, err, "could not execute network request")
+	})
+
+	t.Run("test2", func(t *testing.T) {
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+		err := request2.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matchCount++
+			}
+			finalEvent = event
+		})
+		require.Nil(t, err, "could not execute network request")
+	})
+
+	require.NotNil(t, finalEvent, "could not get event output from request")
+	require.Equal(t, 2, matchCount, "could not get correct match count")
+}
+
+// consult @Ice3man543 before making any breaking changes to this test (context: vuln_hash)
+func TestReqURLPattern(t *testing.T) {
+	options := testutils.DefaultOptions
+
+	// assume this was a preprocessor
+	// {{randstr}} => 2eNU2kbrOcUDzhnUL1RGvSo1it7
+	testutils.Init(options)
+	templateID := "testing-http"
+	request := &Request{
+		ID: templateID,
+		Raw: []string{
+			`GET /{{rand_char("abc")}}/{{interactsh-url}}/123?query={{rand_int(1, 10)}}&data=2eNU2kbrOcUDzhnUL1RGvSo1it7 HTTP/1.1
+			Host: {{Hostname}}
+			User-Agent: Mozilla/5.0 (X11; Fedora; Linux x86_64; rv:80.0) Gecko/20100101 Firefox/80.0
+			Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+			Accept-Language: en-US,en;q=0.5
+			`,
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Type: matchers.MatcherTypeHolder{MatcherType: matchers.DSLMatcher},
+				DSL:  []string{"true"},
+			}},
+		},
+		IterateAll: true,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// always return 200
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`match`))
+	}))
+	defer ts.Close()
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	interactshOpts := interactsh.DefaultOptions(executerOpts.Output, nil, executerOpts.Progress)
+	interactshOpts.ServerURL, interactshOpts.HTTPClient = testutils.NewInteractshServer(t)
+	client, _ := interactsh.New(interactshOpts)
+	executerOpts.Interactsh = client
+	defer client.Close()
+	executerOpts.ExportReqURLPattern = true
+
+	// this is how generated constants are added to template
+	// generated constants are preprocessors that are executed while loading once
+	executerOpts.Constants = map[string]interface{}{
+		"{{randstr}}": "2eNU2kbrOcUDzhnUL1RGvSo1it7",
+	}
+
+	err := request.Compile(executerOpts)
+	require.Nil(t, err, "could not compile network request")
+
+	var finalEvent *output.InternalWrappedEvent
+	var matchCount int
+	t.Run("test", func(t *testing.T) {
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+		err := request.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matchCount++
+			}
+			finalEvent = event
+		})
+		require.Nil(t, err, "could not execute network request")
+	})
+	require.NotNil(t, finalEvent, "could not get event output from request")
+	require.Equal(t, 1, matchCount, "could not get correct match count")
+	require.NotEmpty(t, finalEvent.Results[0].ReqURLPattern, "could not get req url pattern")
+	require.Equal(t, `/{{rand_char("abc")}}/{{interactsh-url}}/123?query={{rand_int(1, 10)}}&data={{randstr}}`, finalEvent.Results[0].ReqURLPattern)
+}
+
+// fakeHostErrorsCache implements hosterrorscache.CacheInterface minimally for tests
+type fakeHostErrorsCache struct{}
+
+func (f *fakeHostErrorsCache) SetVerbose(bool)                                {}
+func (f *fakeHostErrorsCache) Close()                                         {}
+func (f *fakeHostErrorsCache) Remove(*contextargs.Context)                    {}
+func (f *fakeHostErrorsCache) MarkFailed(string, *contextargs.Context, error) {}
+func (f *fakeHostErrorsCache) MarkFailedOrRemove(string, *contextargs.Context, error) {
+}
+
+// Check always returns true to simulate an already unresponsive host
+func (f *fakeHostErrorsCache) Check(string, *contextargs.Context) bool { return true }
+
+// IsPermanentErr returns false for tests
+func (f *fakeHostErrorsCache) IsPermanentErr(*contextargs.Context, error) bool { return false }
+
+// spyHostErrorsCache records how the request path interacts with the cache:
+// a mark (non-nil error) versus a reset (nil error). Check returns skip so the
+// request actually executes.
+type spyHostErrorsCache struct {
+	marks  atomic.Int32
+	resets atomic.Int32
+	skip   bool
+}
+
+func (s *spyHostErrorsCache) SetVerbose(bool)             {}
+func (s *spyHostErrorsCache) Close()                      {}
+func (s *spyHostErrorsCache) Remove(*contextargs.Context) { s.resets.Add(1) }
+func (s *spyHostErrorsCache) MarkFailed(p string, c *contextargs.Context, err error) {
+	s.MarkFailedOrRemove(p, c, err)
+}
+func (s *spyHostErrorsCache) MarkFailedOrRemove(_ string, _ *contextargs.Context, err error) {
+	if err == nil {
+		s.resets.Add(1)
+	} else {
+		s.marks.Add(1)
+	}
+}
+func (s *spyHostErrorsCache) Check(string, *contextargs.Context) bool         { return s.skip }
+func (s *spyHostErrorsCache) IsPermanentErr(*contextargs.Context, error) bool { return false }
+
+type addressSpyHostErrorsCache struct {
+	mu     sync.Mutex
+	checks []string
+	resets []string
+	marks  []string
+	// unresponsive is the address Check reports as unresponsive.
+	unresponsive string
+}
+
+func (s *addressSpyHostErrorsCache) SetVerbose(bool) {}
+func (s *addressSpyHostErrorsCache) Close()          {}
+func (s *addressSpyHostErrorsCache) Remove(ctx *contextargs.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.resets = append(s.resets, ctx.MetaInput.Address())
+}
+func (s *addressSpyHostErrorsCache) MarkFailed(string, *contextargs.Context, error) {}
+func (s *addressSpyHostErrorsCache) MarkFailedOrRemove(_ string, ctx *contextargs.Context, err error) {
+	if err == nil {
+		s.Remove(ctx)
+
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.marks = append(s.marks, ctx.MetaInput.Address())
+}
+func (s *addressSpyHostErrorsCache) Check(_ string, ctx *contextargs.Context) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	address := ctx.MetaInput.Address()
+	s.checks = append(s.checks, address)
+
+	return address == s.unresponsive
+}
+func (s *addressSpyHostErrorsCache) IsPermanentErr(*contextargs.Context, error) bool {
+	return false
+}
+
+func TestHTTPResetsHostCacheOnSuccess(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "ok")
+	}))
+	defer ts.Close()
+
+	templateID := "reset-on-success"
+	req := &Request{
+		ID:     templateID,
+		Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:   []string{"{{BaseURL}}/"},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"ok"},
+			}},
+		},
+	}
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	spy := &spyHostErrorsCache{}
+	executerOpts.HostErrorsCache = spy
+	require.NoError(t, req.Compile(executerOpts))
+
+	metadata := make(output.InternalEvent)
+	previous := make(output.InternalEvent)
+	ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+	err := req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+	require.NoError(t, err)
+
+	require.Greater(t, spy.resets.Load(), int32(0), "a successful request must reset the host-errors cache")
+	require.Equal(t, int32(0), spy.marks.Load(), "a successful request must not mark a host error")
+}
+
+func TestParallelHTTPResetsHostCacheOnSuccess(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "ok")
+	}))
+	defer ts.Close()
+
+	templateID := "parallel-reset-on-success"
+	req := &Request{
+		ID:      templateID,
+		Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:    []string{"{{BaseURL}}/p?x={{v}}"},
+		Threads: 2,
+		Payloads: map[string]interface{}{
+			"v": []string{"1", "2", "3", "4"},
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"ok"},
+			}},
+		},
+	}
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	spy := &spyHostErrorsCache{}
+	executerOpts.HostErrorsCache = spy
+	require.NoError(t, req.Compile(executerOpts))
+
+	metadata := make(output.InternalEvent)
+	previous := make(output.InternalEvent)
+	ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+	err := req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+	require.NoError(t, err)
+
+	require.Greater(t, spy.resets.Load(), int32(0), "successful parallel requests must reset the host-errors cache")
+	require.Equal(t, int32(0), spy.marks.Load(), "successful parallel requests must not mark a host error")
+}
+
+func TestParallelHTTPResetsUpdatedHostCacheKeyOnSuccess(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "ok")
+	}))
+	defer ts.Close()
+
+	templateID := "parallel-reset-updated-host"
+	req := &Request{
+		ID:      templateID,
+		Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:    []string{ts.URL + "/p?x={{v}}"},
+		Threads: 2,
+		Payloads: map[string]interface{}{
+			"v": []string{"1", "2"},
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"ok"},
+			}},
+		},
+	}
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	spy := &addressSpyHostErrorsCache{}
+	executerOpts.HostErrorsCache = spy
+	require.NoError(t, req.Compile(executerOpts))
+
+	metadata := make(output.InternalEvent)
+	previous := make(output.InternalEvent)
+	ctxArgs := contextargs.NewWithInput(context.Background(), "http://example.invalid")
+	err := req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+	require.NoError(t, err)
+
+	expectedAddress := contextargs.NewWithInput(context.Background(), ts.URL).MetaInput.Address()
+	require.Contains(t, spy.checks, expectedAddress, "generated request host must be checked")
+	require.Contains(t, spy.resets, expectedAddress, "success must reset the generated request host")
+}
+
+// A target without a scheme is sent to https, so the transport records its
+// failures at port 443, and the host errors cache must be checked there too
+// (#8175). The spy reports 443 as unresponsive, so nothing is sent.
+//
+//nolint:exhaustruct,exhaustruct_v5,paralleltest // fixtures keep zero-value defaults; testutils.Init state is shared
+func TestSchemelessTargetChecksHostErrorsAtRequestPort(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	tests := []struct {
+		name string
+		req  *Request
+	}{
+		{
+			name: "sequential",
+			req: &Request{
+				ID:     "schemeless-sequential",
+				Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+				Path:   []string{"{{BaseURL}}/n"},
+			},
+		},
+		{
+			name: "parallel",
+			req: &Request{
+				ID:       "schemeless-parallel",
+				Method:   HTTPMethodTypeHolder{MethodType: HTTPGet},
+				Path:     []string{"{{BaseURL}}/n?x={{v}}"},
+				Threads:  2,
+				Payloads: map[string]any{"v": []string{"1", "2"}},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+				ID:   test.req.ID,
+				Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+			})
+			spy := &addressSpyHostErrorsCache{unresponsive: "127.0.0.1:443"}
+			executerOpts.HostErrorsCache = spy
+			require.NoError(t, test.req.Compile(executerOpts))
+
+			ctxArgs := contextargs.NewWithInput(context.Background(), "127.0.0.1")
+			err := test.req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+				func(*output.InternalWrappedEvent) {})
+
+			require.Contains(t, spy.checks, "127.0.0.1:443", "the request port must be checked")
+			// A sent request records a mark if it fails and a reset if it succeeds.
+			require.Empty(t, slices.Concat(spy.marks, spy.resets), "no request may be sent to an unresponsive port")
+			require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+		})
+	}
+}
+
+// A literal URL of the target is classified as possibly leaving it, so the
+// engine runs the template. The request path must still report the skip when
+// that URL's address is unresponsive.
+func TestLiteralTargetURLReportsUnresponsiveSkip(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	req := &Request{
+		ID:     "literal-same-address",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:   []string{"https://127.0.0.1/"},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   req.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	spy := &addressSpyHostErrorsCache{unresponsive: "127.0.0.1:443"}
+	executerOpts.HostErrorsCache = spy
+	require.NoError(t, req.Compile(executerOpts))
+
+	err := req.ExecuteWithResults(contextargs.NewWithInput(context.Background(), "https://127.0.0.1"),
+		make(output.InternalEvent), make(output.InternalEvent), func(*output.InternalWrappedEvent) {})
+
+	require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+	require.Empty(t, slices.Concat(spy.marks, spy.resets), "no request may be sent to an unresponsive port")
+}
+
+// Each request outcome is recorded at the port the request went to, so a
+// success resets the same entry its failures count against (#8175). The
+// requests reach 127.0.0.1:443: a closed port records marks, an open one
+// resets, and both must use 443.
+//
+//nolint:exhaustruct,exhaustruct_v5,paralleltest // fixtures keep zero-value defaults; testutils.Init state is shared
+func TestSchemelessTargetRecordsHostErrorsAtRequestPort(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	tests := []struct {
+		name string
+		req  *Request
+	}{
+		{
+			name: "sequential",
+			req: &Request{
+				ID:     "schemeless-record-sequential",
+				Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+				Path:   []string{"{{BaseURL}}/n"},
+			},
+		},
+		{
+			name: "parallel",
+			req: &Request{
+				ID:       "schemeless-record-parallel",
+				Method:   HTTPMethodTypeHolder{MethodType: HTTPGet},
+				Path:     []string{"{{BaseURL}}/n?x={{v}}"},
+				Threads:  2,
+				Payloads: map[string]any{"v": []string{"1", "2"}},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+				ID:   test.req.ID,
+				Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+			})
+			spy := &addressSpyHostErrorsCache{}
+			executerOpts.HostErrorsCache = spy
+			require.NoError(t, test.req.Compile(executerOpts))
+
+			ctxArgs := contextargs.NewWithInput(context.Background(), "127.0.0.1")
+			// The outcome depends on what listens on 443, so only the recorded keys are checked.
+			_ = test.req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+				func(*output.InternalWrappedEvent) {})
+
+			recorded := slices.Concat(spy.marks, spy.resets)
+			require.NotEmpty(t, recorded, "each request outcome must be recorded")
+
+			for _, address := range recorded {
+				require.Equal(t, "127.0.0.1:443", address)
+			}
+		})
+	}
+}
+
+// Parallel requests run with the target as given, so a target without a
+// scheme keeps it out of the event host, as in the sequential path. Result
+// fields and issue deduplication are built from that host.
+//
+//nolint:exhaustruct,exhaustruct_v5,paralleltest // fixtures keep zero-value defaults; testutils.Init state is shared
+func TestParallelSchemelessTargetKeepsEventHost(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprintf(w, "ok")
+	}))
+	defer server.Close()
+
+	req := &Request{
+		ID:       "schemeless-event-host",
+		Method:   HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:     []string{"{{BaseURL}}/p?x={{v}}"},
+		Threads:  2,
+		Payloads: map[string]any{"v": []string{"1", "2"}},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   req.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, req.Compile(executerOpts))
+
+	target := server.Listener.Addr().String()
+
+	var (
+		hostsMu sync.Mutex
+		hosts   []any
+	)
+
+	ctxArgs := contextargs.NewWithInput(context.Background(), target)
+	err := req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+		func(event *output.InternalWrappedEvent) {
+			hostsMu.Lock()
+			defer hostsMu.Unlock()
+
+			hosts = append(hosts, event.InternalEvent["host"])
+		})
+	require.NoError(t, err)
+	require.Equal(t, []any{target, target}, hosts)
+}
+
+func TestExecuteParallelHTTP_StopAtFirstMatch(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	// server that always matches
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "match")
+	}))
+	defer ts.Close()
+
+	templateID := "parallel-stop-first"
+	req := &Request{
+		ID:      templateID,
+		Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:    []string{"{{BaseURL}}/p?x={{v}}"},
+		Threads: 2,
+		Payloads: map[string]interface{}{
+			"v": []string{"1", "2"},
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"match"},
+			}},
+		},
+		StopAtFirstMatch: true,
+	}
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	err := req.Compile(executerOpts)
+	require.NoError(t, err)
+
+	var matches int32
+	metadata := make(output.InternalEvent)
+	previous := make(output.InternalEvent)
+	ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+	err = req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+		if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+			atomic.AddInt32(&matches, 1)
+		}
+	})
+	require.NoError(t, err)
+	require.Equal(t, int32(1), atomic.LoadInt32(&matches), "expected only first match to be processed")
+}
+
+func TestExecuteParallelHTTP_StopAtFirstMatchCancelsQueuedRateLimitWaiters(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.ExecutionId = t.Name()
+	options.PerHostRateLimit = true
+	options.PerHostRateLimitPoolSize = -1
+	options.RateLimit = 1
+	options.RateLimitDuration = time.Second
+	options.RestrictLocalNetworkAccess = false
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = fmt.Fprint(writer, "match")
+	}))
+	defer server.Close()
+
+	request := &Request{
+		ID:      "parallel-stop-first-rate-limit",
+		Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:    []string{"{{BaseURL}}/p?x={{v}}"},
+		Threads: 10,
+		Payloads: map[string]interface{}{
+			"v": []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"},
+		},
+		Operators: operators.Operators{Matchers: []*matchers.Matcher{{
+			Part:  "body",
+			Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+			Words: []string{"match"},
+		}}},
+		StopAtFirstMatch: true,
+	}
+	executerOptions := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOptions))
+
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), server.URL),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(*output.InternalWrappedEvent) {},
+	)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), requests.Load())
+}
+
+func TestExecuteParallelHTTP_SkipOnUnresponsiveFromCache(t *testing.T) {
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+
+	// server that would match if reached
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprintf(w, "match")
+	}))
+	defer ts.Close()
+
+	templateID := "parallel-skip-unresponsive"
+	req := &Request{
+		ID:      templateID,
+		Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:    []string{"{{BaseURL}}/p?x={{v}}"},
+		Threads: 2,
+		Payloads: map[string]interface{}{
+			"v": []string{"1", "2"},
+		},
+		Operators: operators.Operators{
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"match"},
+			}},
+		},
+	}
+
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   templateID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	// inject fake host errors cache that forces skip
+	executerOpts.HostErrorsCache = &fakeHostErrorsCache{}
+
+	err := req.Compile(executerOpts)
+	require.NoError(t, err)
+
+	var matches int32
+	metadata := make(output.InternalEvent)
+	previous := make(output.InternalEvent)
+	ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+	err = req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {
+		if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+			atomic.AddInt32(&matches, 1)
+		}
+	})
+	require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+	require.Equal(t, int32(0), atomic.LoadInt32(&matches), "expected no matches when host is marked unresponsive")
+}
+
+// TestExecuteParallelHTTP_GoroutineLeaks uses goleak to detect goroutine leaks in all HTTP parallel execution scenarios
+func TestExecuteParallelHTTP_GoroutineLeaks(t *testing.T) {
+	defer goleak.VerifyNone(t,
+		goleak.IgnoreAnyContainingPkg("go.opencensus.io/stats/view"),
+		goleak.IgnoreAnyContainingPkg("github.com/syndtr/goleveldb"),
+		goleak.IgnoreAnyContainingPkg("github.com/projectdiscovery/rod"),
+		goleak.IgnoreAnyContainingPkg("github.com/projectdiscovery/interactsh/pkg/server"),
+		goleak.IgnoreAnyContainingPkg("github.com/projectdiscovery/interactsh/pkg/client"),
+		goleak.IgnoreAnyContainingPkg("github.com/projectdiscovery/ratelimit"),
+		goleak.IgnoreAnyFunction("github.com/syndtr/goleveldb/leveldb/util.(*BufferPool).drain"),
+		goleak.IgnoreAnyFunction("github.com/syndtr/goleveldb/leveldb.(*DB).compactionError"),
+		goleak.IgnoreAnyFunction("github.com/syndtr/goleveldb/leveldb.(*DB).mpoolDrain"),
+		goleak.IgnoreAnyFunction("github.com/syndtr/goleveldb/leveldb.(*DB).tCompaction"),
+		goleak.IgnoreAnyFunction("github.com/syndtr/goleveldb/leveldb.(*DB).mCompaction"),
+		// expirable LRU cache creates a background goroutine for TTL expiration that persists
+		// see: https://github.com/hashicorp/golang-lru/blob/770151e9c8cdfae1797826b7b74c33d6f103fbd8/expirable/expirable_lru.go#L79
+		goleak.IgnoreAnyContainingPkg("github.com/hashicorp/golang-lru/v2/expirable"),
+		// net/http keep-alive connections spawn persistConn read/write loops that are
+		// owned by the transport's idle-connection pool, not by the parallel executor.
+		// They are torn down asynchronously on idle timeout, and on slower runners
+		// (e.g. windows) that teardown can outlast goleak's retry window, so ignore them.
+		goleak.IgnoreAnyFunction("net/http.(*persistConn).writeLoop"),
+		goleak.IgnoreAnyFunction("net/http.(*persistConn).readLoop"),
+	)
+
+	options := testutils.DefaultOptions
+	testutils.Init(options)
+	defer testutils.Cleanup(options)
+
+	// Test Case 1: Normal execution with StopAtFirstMatch
+	t.Run("StopAtFirstMatch", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(10 * time.Millisecond)
+			_, _ = fmt.Fprintf(w, "test response")
+		}))
+		defer ts.Close()
+
+		req := &Request{
+			ID:      "parallel-stop-first-match",
+			Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:    []string{"{{BaseURL}}/test?param={{payload}}"},
+			Threads: 4,
+			Payloads: map[string]interface{}{
+				"payload": []string{"1", "2", "3", "4", "5", "6", "7", "8"},
+			},
+			Operators: operators.Operators{
+				Matchers: []*matchers.Matcher{{
+					Part:  "body",
+					Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+					Words: []string{"test response"},
+				}},
+			},
+			StopAtFirstMatch: true,
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-stop-first-match",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+
+		err = req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+		require.NoError(t, err)
+	})
+
+	// Test Case 2: Unresponsive host scenario
+	t.Run("UnresponsiveHost", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = fmt.Fprintf(w, "response")
+		}))
+		defer ts.Close()
+
+		req := &Request{
+			ID:      "parallel-unresponsive",
+			Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:    []string{"{{BaseURL}}/test?param={{payload}}"},
+			Threads: 3,
+			Payloads: map[string]interface{}{
+				"payload": []string{"1", "2", "3", "4", "5"},
+			},
+			Operators: operators.Operators{
+				Matchers: []*matchers.Matcher{{
+					Part:  "body",
+					Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+					Words: []string{"response"},
+				}},
+			},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-unresponsive",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+		executerOpts.HostErrorsCache = &fakeHostErrorsCache{}
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+		ctxArgs := contextargs.NewWithInput(context.Background(), ts.URL)
+
+		err = req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+		require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+	})
+
+	// Test Case 3: Context cancellation scenario
+	t.Run("ContextCancellation", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(200 * time.Millisecond)
+			_, _ = fmt.Fprintf(w, "response")
+		}))
+		defer ts.Close()
+
+		req := &Request{
+			ID:      "parallel-context-cancel",
+			Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:    []string{"{{BaseURL}}/test?param={{payload}}"},
+			Threads: 3,
+			Payloads: map[string]interface{}{
+				"payload": []string{"1", "2", "3", "4", "5"},
+			},
+			Operators: operators.Operators{
+				Matchers: []*matchers.Matcher{{
+					Part:  "body",
+					Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+					Words: []string{"response"},
+				}},
+			},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-context-cancel",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		metadata := make(output.InternalEvent)
+		previous := make(output.InternalEvent)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		ctxArgs := contextargs.NewWithInput(ctx, ts.URL)
+
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		err = req.ExecuteWithResults(ctxArgs, metadata, previous, func(event *output.InternalWrappedEvent) {})
+		require.Error(t, err)
+		require.Equal(t, context.Canceled, err)
+	})
+
+	// Test Case 4: the context is canceled while payloads still wait for a
+	// worker, so the scan returns before its stop-at-first-match handler is
+	// waited on (#8181).
+	//
+	//nolint:exhaustruct,exhaustruct_v5,paralleltest // zero-value fixtures; goleak and testutils.Init state are shared
+	t.Run("ContextCancellationWhileQueueing", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-time.After(200 * time.Millisecond):
+			}
+
+			_, _ = fmt.Fprintf(writer, "response")
+		}))
+		defer server.Close()
+
+		req := &Request{
+			ID:      "parallel-context-cancel-queueing",
+			Method:  HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:    []string{"{{BaseURL}}/test?param={{payload}}"},
+			Threads: 2,
+			Payloads: map[string]any{
+				"payload": []string{"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"},
+			},
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"response"},
+			}},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-context-cancel-queueing",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+
+		ctxArgs := contextargs.NewWithInput(ctx, server.URL)
+		err = req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+			func(*output.InternalWrappedEvent) {})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+
+	// Test Case 5: only the port the requests go to is unresponsive, not the
+	// target's own, so the scan returns from inside the payload loop.
+	//
+	//nolint:exhaustruct,exhaustruct_v5,paralleltest // zero-value fixtures; goleak and testutils.Init state are shared
+	t.Run("UnresponsiveRequestPort", func(t *testing.T) {
+		req := &Request{
+			ID:       "parallel-unresponsive-request-port",
+			Method:   HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:     []string{"{{BaseURL}}/n?x={{v}}"},
+			Threads:  2,
+			Payloads: map[string]any{"v": []string{"1", "2"}},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-unresponsive-request-port",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+		executerOpts.HostErrorsCache = &addressSpyHostErrorsCache{unresponsive: "127.0.0.1:443"}
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		// A target without a scheme is sent to https, so its own address is
+		// 127.0.0.1:80 while its requests go to 127.0.0.1:443.
+		ctxArgs := contextargs.NewWithInput(t.Context(), "127.0.0.1")
+		err = req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+			func(*output.InternalWrappedEvent) {})
+		require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+	})
+
+	// Test Case 5b: the target's own port is unresponsive, but the requests to
+	// another port are sent. Skipping a request to the target's port continues
+	// with the next one, and nothing it skips is recorded (#8201).
+	//
+	//nolint:exhaustruct,exhaustruct_v5,paralleltest // zero-value fixtures; goleak and testutils.Init state are shared
+	t.Run("UnresponsiveTargetPortSkipsAndContinues", func(t *testing.T) {
+		var received atomic.Int32
+
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			received.Add(1)
+
+			_, _ = fmt.Fprintf(writer, "response")
+		}))
+		defer server.Close()
+
+		req := &Request{
+			ID:       "parallel-unresponsive-target-port",
+			Method:   HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:     []string{"{{BaseURL}}/n?x={{v}}", server.URL + "/n?x={{v}}"},
+			Threads:  2,
+			Payloads: map[string]any{"v": []string{"1", "2"}},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-unresponsive-target-port",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+		spy := &addressSpyHostErrorsCache{unresponsive: "127.0.0.1:443"}
+		executerOpts.HostErrorsCache = spy
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		ctxArgs := contextargs.NewWithInput(t.Context(), "https://127.0.0.1")
+		err = req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+			func(*output.InternalWrappedEvent) {})
+		require.ErrorIs(t, err, hosterrorscache.ErrUnresponsiveHost)
+		require.EqualValues(t, 2, received.Load(), "the requests to the open port are sent")
+		require.NotContains(t, spy.marks, "127.0.0.1:443")
+		require.NotContains(t, spy.resets, "127.0.0.1:443")
+	})
+
+	// Test Case 6: a first match cancels the workers while payloads are still
+	// being queued, and the scan can return before its stop-at-first-match
+	// handler is waited on. Only some scans take that return, so it runs 30
+	// (#8181).
+	//
+	//nolint:exhaustruct,exhaustruct_v5,paralleltest // zero-value fixtures; goleak and testutils.Init state are shared
+	t.Run("StopAtFirstMatchWhileQueueing", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			_, _ = fmt.Fprintf(writer, "response")
+		}))
+		defer server.Close()
+
+		payloads := make([]string, 2000)
+		for i := range payloads {
+			payloads[i] = strconv.Itoa(i)
+		}
+
+		req := &Request{
+			ID:               "parallel-stop-first-match-queueing",
+			Method:           HTTPMethodTypeHolder{MethodType: HTTPGet},
+			Path:             []string{"{{BaseURL}}/test?param={{payload}}"},
+			Threads:          50,
+			Payloads:         map[string]any{"payload": payloads},
+			StopAtFirstMatch: true,
+			Matchers: []*matchers.Matcher{{
+				Part:  "body",
+				Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+				Words: []string{"response"},
+			}},
+		}
+
+		executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+			ID:   "parallel-stop-first-match-queueing",
+			Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+		})
+
+		err := req.Compile(executerOpts)
+		require.NoError(t, err)
+
+		for range 30 {
+			ctxArgs := contextargs.NewWithInput(t.Context(), server.URL)
+			err = req.ExecuteWithResults(ctxArgs, make(output.InternalEvent), make(output.InternalEvent),
+				func(*output.InternalWrappedEvent) {})
+			require.NoError(t, err)
+		}
+	})
+}
+
+func TestOutputIP(t *testing.T) {
+	history := func(entries map[string]string) func(string) string {
+		return func(hostname string) string { return entries[hostname] }
+	}
+	noHistory := history(nil)
+
+	tests := []struct {
+		name        string
+		customIP    string
+		host        string
+		hostname    string
+		getDialedIP func(string) string
+		want        string
+	}{
+		{name: "ipv4 literal without dial history", host: "192.0.2.1:8080", hostname: "192.0.2.1", getDialedIP: noHistory, want: "192.0.2.1"},
+		{name: "ipv4 literal with nil dialer", host: "192.0.2.1", hostname: "192.0.2.1", want: "192.0.2.1"},
+		{name: "bracketed ipv6 without dial history", host: "[2001:db8::1]", hostname: "[2001:db8:", getDialedIP: noHistory, want: "2001:db8::1"},
+		{name: "bracketed ipv6 with port without dial history", host: "[2001:db8::1]:443", hostname: "[2001:db8::1]", getDialedIP: noHistory, want: "2001:db8::1"},
+		{name: "bare ipv6 without dial history", host: "2001:db8::1", hostname: "2001:db8:", getDialedIP: noHistory, want: "2001:db8::1"},
+		{name: "hostname without dial history", host: "example.com:443", hostname: "example.com", getDialedIP: noHistory, want: ""},
+		{name: "dial history wins over ip literal", host: "192.0.2.1:80", hostname: "192.0.2.1", getDialedIP: history(map[string]string{"192.0.2.1": "198.51.100.7"}), want: "198.51.100.7"},
+		{name: "dial history for hostname", host: "example.com", hostname: "example.com", getDialedIP: history(map[string]string{"example.com": "198.51.100.7"}), want: "198.51.100.7"},
+		{name: "custom ip wins", customIP: "203.0.113.5", host: "192.0.2.1", hostname: "192.0.2.1", getDialedIP: history(map[string]string{"192.0.2.1": "198.51.100.7"}), want: "203.0.113.5"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, outputIP(tt.customIP, tt.host, tt.hostname, tt.getDialedIP))
+		})
+	}
+}
+
+func TestLooksLikeHTTPToHTTPSMismatch(t *testing.T) {
+	t.Run("matches genuine nginx/openresty mismatch page", func(t *testing.T) {
+		body := `<html>
+<head><title>400 The plain HTTP request was sent to HTTPS port</title></head>
+<body>
+<center><h1>400 Bad Request</h1></center>
+<center>The plain HTTP request was sent to HTTPS port</center>
+<hr><center>nginx/1.31.6</center>
+</body>
+</html>`
+		resp := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(body))}
+		require.True(t, looksLikeHTTPToHTTPSMismatch(resp))
+	})
+
+	t.Run("does not match an unrelated 400 and leaves the body intact", func(t *testing.T) {
+		body := "<html><body>400 Bad Request - unrelated app error</body></html>"
+		resp := &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(body))}
+		require.False(t, looksLikeHTTPToHTTPSMismatch(resp))
+
+		// downstream readers (matchers, dumps, project cache) must still see
+		// the full, untouched body after a non-matching peek
+		remaining, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.Equal(t, body, string(remaining))
+	})
+
+	t.Run("ignores non-400 status codes even if the text is present", func(t *testing.T) {
+		body := "The plain HTTP request was sent to HTTPS port"
+		resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}
+		require.False(t, looksLikeHTTPToHTTPSMismatch(resp))
+	})
+}
+
+func TestPerHostRateLimitHonorsRequestContextCancellation(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.ExecutionId = t.Name()
+	options.PerHostRateLimit = true
+	options.PerHostRateLimitPoolSize = -1
+	options.RateLimit = 1
+	options.RateLimitDuration = 2 * time.Second
+	options.RestrictLocalNetworkAccess = false
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		_, _ = fmt.Fprint(writer, "ok")
+	}))
+	defer server.Close()
+
+	request := &Request{
+		ID:     "per-host-rate-limit-cancellation",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:   []string{"{{BaseURL}}/"},
+		Operators: operators.Operators{Matchers: []*matchers.Matcher{{
+			Part:  "body",
+			Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+			Words: []string{"ok"},
+		}}},
+	}
+	executerOptions := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOptions))
+
+	execute := func(ctx context.Context) error {
+		return request.ExecuteWithResults(
+			contextargs.NewWithInput(ctx, server.URL),
+			make(output.InternalEvent),
+			make(output.InternalEvent),
+			func(*output.InternalWrappedEvent) {},
+		)
+	}
+	require.NoError(t, execute(context.Background()))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- execute(ctx) }()
+	time.Sleep(100 * time.Millisecond)
+	cancelledAt := time.Now()
+	cancel()
+
+	err := <-result
+	cancellationDelay := time.Since(cancelledAt)
+	t.Logf("request returned %s after its context was cancelled", cancellationDelay.Round(time.Millisecond))
+	require.ErrorIs(t, err, context.Canceled)
+	require.Less(t, cancellationDelay, 250*time.Millisecond)
+}
+
+func TestDumpedRequestKeepsBodyServerDidNotRead(t *testing.T) {
+	// The server answers in full, then holds the connection without reading
+	// the body, so the transport is still writing it when the response arrives.
+	release := make(chan struct{})
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "2")
+		_, _ = w.Write([]byte("ok"))
+		w.(http.Flusher).Flush()
+		<-release
+	}))
+	defer target.Close()
+	defer close(release)
+
+	options := testutils.DefaultOptions.Copy()
+	options.SetExecutionID(t.Name())
+	testutils.Init(options)
+	t.Cleanup(func() { testutils.Cleanup(options) })
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   "dump-body",
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+
+	body := strings.Repeat("A", 4<<20)
+	requests := []*Request{
+		{
+			ID:     "post",
+			Method: HTTPMethodTypeHolder{MethodType: HTTPPost},
+			Path:   []string{"{{BaseURL}}/"},
+			Body:   body,
+		},
+		{
+			ID:  "get",
+			Raw: []string{"GET / HTTP/1.1\nHost: {{Hostname}}\n\n" + body},
+		},
+		{
+			ID:  "chunked",
+			Raw: []string{"POST / HTTP/1.1\nHost: {{Hostname}}\nTransfer-Encoding: chunked\n\n" + body},
+		},
+	}
+	for _, request := range requests {
+		require.NoError(t, request.Compile(executerOpts))
+		// how much the transport has written when the response lands varies, so
+		// a few rounds make a lost body show up reliably
+		for range 3 {
+			var dumped string
+			input := contextargs.NewWithInput(context.Background(), target.URL)
+			err := request.ExecuteWithResults(input, output.InternalEvent{}, output.InternalEvent{}, func(event *output.InternalWrappedEvent) {
+				dumped, _ = event.InternalEvent["request"].(string)
+			})
+			require.NoError(t, err)
+			require.True(t, strings.HasSuffix(dumped, "\r\n\r\n"+body), "%s recorded request lost its body: %d of %d bytes", request.ID, len(dumped), len(body))
+		}
+	}
+}
+
+func TestReuseRequestBodyKeepsExcludedEncoding(t *testing.T) {
+	body := []byte("original")
+	for _, tc := range []struct {
+		name          string
+		method        string
+		header        string
+		contentLength int64
+		wantLength    int64
+	}{
+		{name: "post", method: http.MethodPost, contentLength: 1, wantLength: int64(len(body))},
+		{name: "get", method: http.MethodGet, contentLength: 3, wantLength: 3},
+		{name: "head", method: http.MethodHead, contentLength: 0, wantLength: 0},
+		{name: "chunked", method: http.MethodPost, header: "chunked", contentLength: -1, wantLength: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := retryablehttp.NewRequest(tc.method, "https://example.com/", body)
+			require.NoError(t, err)
+			req.ContentLength = tc.contentLength
+			if tc.header != "" {
+				req.Header.Set("Transfer-Encoding", tc.header)
+			}
+
+			require.NoError(t, reuseRequestBody(req))
+			require.Equal(t, tc.wantLength, req.ContentLength)
+			if tc.header != "" {
+				require.Equal(t, tc.header, req.Header.Get("Transfer-Encoding"))
+			}
+
+			got, err := io.ReadAll(req.Body)
+			require.NoError(t, err)
+			require.Equal(t, body, got)
+			fresh, err := req.GetBody()
+			require.NoError(t, err)
+			got, err = io.ReadAll(fresh)
+			require.NoError(t, err)
+			require.Equal(t, body, got)
+		})
+	}
+}
+
+func TestHTTPResponseReadSizeHonoursTemplateMaxSize(t *testing.T) {
+	previous := testutils.DefaultOptions.ResponseReadSize
+	t.Cleanup(func() {
+		testutils.DefaultOptions.ResponseReadSize = previous
+	})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(strings.Repeat("A", 2000)))
+	}))
+	defer ts.Close()
+
+	tests := []struct {
+		name                   string
+		templateMaxSize        int
+		globalResponseReadSize int
+		expectedLen            int
+	}{
+		{
+			name:                   "template max-size smaller than global response-size-read",
+			templateMaxSize:        500,
+			globalResponseReadSize: 1000,
+			expectedLen:            500,
+		},
+		{
+			name:                   "global response-size-read acts as ceiling when smaller than template max-size",
+			templateMaxSize:        1500,
+			globalResponseReadSize: 800,
+			expectedLen:            800,
+		},
+		{
+			name:                   "only template max-size specified",
+			templateMaxSize:        500,
+			globalResponseReadSize: 0,
+			expectedLen:            500,
+		},
+		{
+			name:                   "only global response-size-read specified",
+			templateMaxSize:        0,
+			globalResponseReadSize: 600,
+			expectedLen:            600,
+		},
+		{
+			name:                   "negative response-size-read keeps template max-size",
+			templateMaxSize:        500,
+			globalResponseReadSize: -1,
+			expectedLen:            500,
+		},
+		{
+			name:                   "negative response-size-read keeps the default limit",
+			templateMaxSize:        0,
+			globalResponseReadSize: -1,
+			expectedLen:            2000,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := testutils.DefaultOptions
+			opts.ResponseReadSize = tc.globalResponseReadSize
+			testutils.Init(opts)
+
+			request := &Request{
+				ID:      "test-max-size",
+				MaxSize: tc.templateMaxSize,
+				Raw: []string{
+					"GET / HTTP/1.1\nHost: {{Hostname}}\n\n",
+				},
+			}
+			executerOptions := testutils.NewMockExecuterOptions(opts, &testutils.TemplateInfo{
+				ID:   request.ID,
+				Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+			})
+			require.NoError(t, request.Compile(executerOptions))
+
+			var receivedBodyLen int
+			err := request.ExecuteWithResults(
+				contextargs.NewWithInput(context.Background(), ts.URL),
+				make(output.InternalEvent),
+				make(output.InternalEvent),
+				func(event *output.InternalWrappedEvent) {
+					if event != nil && event.InternalEvent != nil {
+						if body, ok := event.InternalEvent["body"].(string); ok {
+							receivedBodyLen = len(body)
+						}
+					}
+				},
+			)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectedLen, receivedBodyLen)
+		})
+	}
+}
+
+// storedResponseWriter keeps the stored response dumps.
+type storedResponseWriter struct {
+	*testutils.MockOutputWriter
+
+	responses []string
+}
+
+func (w *storedResponseWriter) WriteStoreDebugData(_, _, _, data string) {
+	if strings.Contains(data, "Dumped HTTP response") {
+		w.responses = append(w.responses, data)
+	}
+}
+
+// TestHTTPResponseTruncatedUsesEffectiveReadLimit checks that a stored response
+// is marked truncated exactly when its body reached the limit it was read with.
+func TestHTTPResponseTruncatedUsesEffectiveReadLimit(t *testing.T) {
+	previous := MaxBodyRead
+
+	t.Cleanup(func() { MaxBodyRead = previous })
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(strings.Repeat("A", 2000)))
+	}))
+	defer server.Close()
+
+	tests := []struct {
+		name             string
+		defaultLimit     int // replaces MaxBodyRead when set
+		templateMaxSize  int
+		responseReadSize int
+		wantTruncated    bool
+	}{
+		{name: "default limit", defaultLimit: 1000, wantTruncated: true},
+		{name: "default limit, negative response-size-read", defaultLimit: 1000, responseReadSize: -1, wantTruncated: true},
+		{name: "body under default limit", wantTruncated: false},
+		{name: "template max-size", templateMaxSize: 500, wantTruncated: true},
+		{name: "response-size-read", responseReadSize: 800, wantTruncated: true},
+		{name: "max-size below response-size-read", templateMaxSize: 500, responseReadSize: 3000, wantTruncated: true},
+		{name: "limits above body length", templateMaxSize: 4000, responseReadSize: 3000, wantTruncated: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			MaxBodyRead = cmp.Or(tc.defaultLimit, previous)
+
+			opts := testutils.DefaultOptions.Copy()
+			opts.StoreResponse = true
+			opts.ResponseReadSize = tc.responseReadSize
+			testutils.Init(opts)
+			t.Cleanup(func() { testutils.Cleanup(opts) })
+
+			request := &Request{
+				ID:      "test-truncated",
+				MaxSize: tc.templateMaxSize,
+				Raw:     []string{"GET / HTTP/1.1\nHost: {{Hostname}}\n\n"},
+			}
+			executerOptions := testutils.NewMockExecuterOptions(opts, &testutils.TemplateInfo{
+				ID:   request.ID,
+				Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+			})
+			writer := &storedResponseWriter{MockOutputWriter: testutils.NewMockOutputWriter(opts.OmitTemplate)}
+			executerOptions.Output = writer
+			require.NoError(t, request.Compile(executerOptions))
+
+			err := request.ExecuteWithResults(
+				contextargs.NewWithInput(context.Background(), server.URL),
+				make(output.InternalEvent),
+				make(output.InternalEvent),
+				func(*output.InternalWrappedEvent) {},
+			)
+			require.NoError(t, err)
+			require.Len(t, writer.responses, 1)
+			require.Equal(t, tc.wantTruncated, strings.Contains(writer.responses[0], "(Truncated)"))
+		})
+	}
+}
+
+const httpToHTTPSPage = "<html><title>400 The plain HTTP request was sent to HTTPS port</title><center>The plain HTTP request was sent to HTTPS port</center></html>"
+
+// servePlainOrTLS accepts HTTP and TLS on one port. A plaintext request is
+// answered by plain, and a TLS handshake by secure. Nuclei's client skips
+// certificate verification, so the httptest certificate is enough.
+func servePlainOrTLS(t *testing.T, plain, secure http.Handler) (string, *atomic.Int32) {
+	t.Helper()
+	certServer := httptest.NewTLSServer(http.NewServeMux())
+	t.Cleanup(certServer.Close)
+	require.NotEmpty(t, certServer.TLS.Certificates)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var opened []net.Conn
+	var openedMu sync.Mutex
+	t.Cleanup(func() {
+		_ = ln.Close()
+		openedMu.Lock()
+		defer openedMu.Unlock()
+		for _, conn := range opened {
+			_ = conn.Close()
+		}
+	})
+
+	tlsHits := &atomic.Int32{}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{certServer.TLS.Certificates[0]}}
+	go func() {
+		for {
+			conn, acceptErr := ln.Accept()
+			if acceptErr != nil {
+				return
+			}
+			openedMu.Lock()
+			opened = append(opened, conn)
+			openedMu.Unlock()
+			go func(conn net.Conn) {
+				_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+				var first [1]byte
+				if _, readErr := io.ReadFull(conn, first[:]); readErr != nil {
+					return
+				}
+				peeked := &prefixConn{Conn: conn, prefix: append([]byte(nil), first[:]...)}
+				_ = peeked.SetReadDeadline(time.Time{})
+				if first[0] == 0x16 {
+					tlsHits.Add(1)
+					tlsConn := tls.Server(peeked, tlsConfig)
+					if handshakeErr := tlsConn.Handshake(); handshakeErr != nil {
+						return
+					}
+					serveOne(tlsConn, secure)
+					return
+				}
+				serveOne(peeked, plain)
+			}(conn)
+		}
+	}()
+	return "http://" + ln.Addr().String(), tlsHits
+}
+
+func mismatchPage() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, httpToHTTPSPage)
+	})
+}
+
+type prefixConn struct {
+	net.Conn
+	prefix []byte
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if len(c.prefix) > 0 {
+		n := copy(p, c.prefix)
+		c.prefix = c.prefix[n:]
+		return n, nil
+	}
+	return c.Conn.Read(p)
+}
+
+type oneShotListener struct {
+	conn net.Conn
+	ch   chan net.Conn
+}
+
+func serveOne(conn net.Conn, handler http.Handler) {
+	ch := make(chan net.Conn, 1)
+	ch <- conn
+	close(ch)
+	_ = (&http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       50 * time.Millisecond,
+	}).Serve(&oneShotListener{conn: conn, ch: ch})
+}
+
+func (l *oneShotListener) Accept() (net.Conn, error) {
+	conn, ok := <-l.ch
+	if !ok {
+		return nil, io.EOF
+	}
+	return conn, nil
+}
+
+func (l *oneShotListener) Close() error { return nil }
+
+func (l *oneShotListener) Addr() net.Addr { return l.conn.LocalAddr() }
+
+func TestHTTPToHTTPSMismatchRetriesOverTLS(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.ExecutionId = t.Name()
+	testutils.Init(options)
+
+	const page = "cpanel-login-ok"
+	target, tlsHits := servePlainOrTLS(t, mismatchPage(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		_, _ = io.WriteString(w, page)
+	}))
+	request := &Request{
+		ID:     "http-to-https-self-heal",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:   []string{"{{BaseURL}}/"},
+		Operators: operators.Operators{Matchers: []*matchers.Matcher{{
+			Part:  "body",
+			Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+			Words: []string{page},
+		}}},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	var matched bool
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), target),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matched = true
+			}
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, matched, "the discovering request must be retried over TLS and matched")
+	require.Equal(t, int32(1), tlsHits.Load())
+}
+
+func TestHTTPToHTTPSMismatchReplaysPostBody(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.ExecutionId = t.Name()
+	testutils.Init(options)
+
+	const payload = "user=root&pass=secret"
+	const page = "cpanel-login-ok"
+	var gotMu sync.Mutex
+	var gotBody string
+	var gotLength int64
+	target, tlsHits := servePlainOrTLS(t, mismatchPage(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, readErr := io.ReadAll(r.Body)
+		gotMu.Lock()
+		if readErr == nil {
+			gotBody = string(body)
+			gotLength = r.ContentLength
+		}
+		gotMu.Unlock()
+		w.Header().Set("Connection", "close")
+		_, _ = io.WriteString(w, page)
+	}))
+
+	request := &Request{
+		ID:     "http-to-https-post-body",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPPost},
+		Path:   []string{"{{BaseURL}}/login"},
+		Body:   payload,
+		Operators: operators.Operators{Matchers: []*matchers.Matcher{{
+			Part:  "body",
+			Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+			Words: []string{page},
+		}}},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	var matched bool
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), target),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matched = true
+			}
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, matched)
+	require.Equal(t, int32(1), tlsHits.Load())
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	require.Equal(t, payload, gotBody)
+	require.Equal(t, int64(len(payload)), gotLength)
+}
+
+func TestHTTPToHTTPSUnrelated400IsNotRetried(t *testing.T) {
+	options := testutils.DefaultOptions.Copy()
+	options.ExecutionId = t.Name()
+	testutils.Init(options)
+
+	target, tlsHits := servePlainOrTLS(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, "unrelated application error")
+	}), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Connection", "close")
+		_, _ = io.WriteString(w, "should-not-run")
+	}))
+
+	request := &Request{
+		ID:     "http-to-https-unrelated-400",
+		Method: HTTPMethodTypeHolder{MethodType: HTTPGet},
+		Path:   []string{"{{BaseURL}}/"},
+		Operators: operators.Operators{Matchers: []*matchers.Matcher{{
+			Part:  "body",
+			Type:  matchers.MatcherTypeHolder{MatcherType: matchers.WordsMatcher},
+			Words: []string{"unrelated application error"},
+		}}},
+	}
+	executerOpts := testutils.NewMockExecuterOptions(options, &testutils.TemplateInfo{
+		ID:   request.ID,
+		Info: model.Info{SeverityHolder: severity.Holder{Severity: severity.Low}, Name: "test"},
+	})
+	require.NoError(t, request.Compile(executerOpts))
+
+	var matched bool
+	err := request.ExecuteWithResults(
+		contextargs.NewWithInput(context.Background(), target),
+		make(output.InternalEvent),
+		make(output.InternalEvent),
+		func(event *output.InternalWrappedEvent) {
+			if event.OperatorsResult != nil && event.OperatorsResult.Matched {
+				matched = true
+			}
+		},
+	)
+	require.NoError(t, err)
+	require.True(t, matched, "an ordinary 400 is still a response the matcher can see")
+	require.Equal(t, int32(0), tlsHits.Load())
+}

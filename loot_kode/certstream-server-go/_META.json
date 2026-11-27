@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T06:51:10.539611+00:00",
+  "name": "certstream-server-go",
+  "repo": "d-Rickyy-b/certstream-server-go",
+  "branch": "master",
+  "license": "MIT",
+  "stars": 243,
+  "commit_sha": "6ae7d175ed0d4c95e58258fc7c735160dc35e7c2",
+  "last_commit_date": "2026-09-13T23:52:45Z",
+  "files_count": 55,
+  "total_bytes": 246959,
+  "output_dir": "./loot_kode/certstream-server-go"
+}
