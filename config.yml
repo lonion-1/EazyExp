@@ -1,0 +1,39 @@
+harvester:
+  user_agent: "TuyulHarvester/1.0 (Python-3.15t)"
+  timeout_sec: 15
+  max_workers: 8
+  output_dir: "./loot_kode"
+  manifest_file: "manifest.jsonl"
+
+storage:
+  hot_format: "jsonl"
+  archive_format: "jsonl.gz"
+  rotate_max_mb: 256
+  gzip_level: 6
+
+targets:
+  - name: "httpx_runner"
+    lang: "go"
+    url: "https://raw.githubusercontent.com/projectdiscovery/httpx/main/runner/runner.go"
+  - name: "subfinder_runner"
+    lang: "go"
+    url: "https://raw.githubusercontent.com/projectdiscovery/subfinder/dev/v2/pkg/runner/runner.go"
+  - name: "nuclei_runner"
+    lang: "go"
+    url: "https://raw.githubusercontent.com/projectdiscovery/nuclei/main/internal/runner/runner.go"
+  - name: "katana_runner"
+    lang: "go"
+    url: "https://raw.githubusercontent.com/projectdiscovery/katana/main/internal/runner/runner.go"
+  - name: "ferox_scanner"
+    lang: "rust"
+    url: "https://raw.githubusercontent.com/epi052/feroxbuster/main/src/scanner/ferox_scanner.rs"
+  - name: "phishuntangler"
+    lang: "python"
+    url: "https://raw.githubusercontent.com/bishopfox/phishuntangler/main/phishuntangler.py"
+  - name: "apkid"
+    lang: "python"
+    url: "https://raw.githubusercontent.com/rednaga/APKiD/master/apkid/apkid.py"
+  - name: "certstream_watcher"
+    lang: "go"
+    url: "https://raw.githubusercontent.com/d-Rickyy-b/certstream-server-go/master/internal/certstream/watcher.go"
+    
