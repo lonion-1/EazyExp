@@ -1,0 +1,23 @@
+name: Sparse Checkout httpx runner
+
+on:
+  workflow_dispatch:
+
+jobs:
+  clone-runner:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout only runner directory
+        uses: actions/checkout@v4
+        with:
+          repository: projectdiscovery/httpx
+          sparse-checkout: |
+            runner
+          sparse-checkout-cone-mode: true
+          path: httpx
+
+      - name: Verify cloned files
+        run: |
+          ls -la httpx/runner
+          
