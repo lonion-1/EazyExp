@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T16:57:46.793482+00:00",
+  "name": "katana",
+  "repo": "projectdiscovery/katana",
+  "branch": "dev",
+  "license": "MIT",
+  "stars": 17905,
+  "commit_sha": "49736813917e8e643fe5593ec1281c718e2358f9",
+  "last_commit_date": "2026-11-26T21:14:18Z",
+  "files_count": 247,
+  "total_bytes": 1824601,
+  "output_dir": "katana/"
+}

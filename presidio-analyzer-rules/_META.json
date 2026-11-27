@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T16:58:19.875653+00:00",
+  "name": "presidio-analyzer-rules",
+  "repo": "microsoft/presidio",
+  "branch": "main",
+  "license": "MIT",
+  "stars": 12085,
+  "commit_sha": "1d597a971e5a4c2945b73a0605f08f725d6e0378",
+  "last_commit_date": "2026-11-24T16:49:52Z",
+  "files_count": 771,
+  "total_bytes": 3498548,
+  "output_dir": "presidio-analyzer-rules/"
+}

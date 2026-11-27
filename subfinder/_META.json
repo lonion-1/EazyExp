@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T16:57:34.003248+00:00",
+  "name": "subfinder",
+  "repo": "projectdiscovery/subfinder",
+  "branch": "dev",
+  "license": "MIT",
+  "stars": 14888,
+  "commit_sha": "fe97d7e4e4d0a0cdfa395ef0931083f7d7c62f0f",
+  "last_commit_date": "2026-11-26T16:51:59Z",
+  "files_count": 148,
+  "total_bytes": 598268,
+  "output_dir": "subfinder/"
+}

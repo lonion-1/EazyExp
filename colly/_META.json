@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T16:57:54.353928+00:00",
+  "name": "colly",
+  "repo": "gocolly/colly",
+  "branch": "master",
+  "license": "Apache-2.0",
+  "stars": 25609,
+  "commit_sha": "d42a1f44c086ea74c375361a0199247cdfebe31b",
+  "last_commit_date": "2026-10-16T13:34:22Z",
+  "files_count": 63,
+  "total_bytes": 280612,
+  "output_dir": "colly/"
+}

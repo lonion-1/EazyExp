@@ -1,0 +1,13 @@
+{
+  "harvested_at": "2026-11-27T16:57:51.554440+00:00",
+  "name": "gotor",
+  "repo": "DedSecInside/gotor",
+  "branch": "main",
+  "license": "GPL-3.0",
+  "stars": 175,
+  "commit_sha": "e5b721cf890025c2cd43db9c48e6f38992b44255",
+  "last_commit_date": "2026-07-19T13:42:55Z",
+  "files_count": 24,
+  "total_bytes": 111529,
+  "output_dir": "gotor/"
+}
