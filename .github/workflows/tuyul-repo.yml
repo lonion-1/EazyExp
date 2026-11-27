@@ -1,23 +1,91 @@
-name: Sparse Checkout httpx runner
+name: Front-Gate Web Indexer (Tier 1)
+# Copyright (c) 2026 EazyWhale (https://github.com/lonion-1)
+# Licensed under the MIT
 
 on:
   workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'Durasi maksimal (menit)'
+        type: string
+        default: '120'
+      cats:
+        description: 'Batasi kategori (koma, mis. comic,film,judol). Kosong = semua'
+        type: string
+        default: ''
+      dry_run:
+        description: 'Dry-run (tidak menulis file apa pun)'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '40 17 */2 * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: frontgate-webindex
+  cancel-in-progress: false
 
 jobs:
-  clone-runner:
+  index:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 180
+    env:
+      PYTHONUNBUFFERED: "1"
     steps:
-      - name: Checkout only runner directory
+      - name: Ambil isi repo
         uses: actions/checkout@v4
-        with:
-          repository: projectdiscovery/httpx
-          sparse-checkout: |
-            runner
-          sparse-checkout-cone-mode: true
-          path: httpx
 
-      - name: Verify cloned files
+      - name: Pasang Python 3.15 Free-Threaded
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.15t'
+
+      - name: Pasang dependensi Python
         run: |
-          ls -la httpx/runner
-          
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Jalankan Harvester / Indexer
+        run: |
+          # Ganti 'main.py' dengan nama skrip Python Anda yang membaca config.yaml
+          python main.py --config config.yaml \
+            --minutes "${{ inputs.minutes || '120' }}" \
+            --cats "${{ inputs.cats }}" \
+            ${{ inputs.dry_run && '--dry-run' || '' }}
+
+      - name: Simpan cache indeks
+        if: always() && inputs.dry_run != true
+        uses: actions/cache/save@v4
+        with:
+          path: .cache/webindex
+          key: webindex-${{ github.run_id }}
+
+      - name: Simpan hasil ke GitHub
+        if: inputs.dry_run != true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          for i in 1 2 3; do
+            git fetch origin "$BRANCH"
+            git reset --soft "origin/$BRANCH"
+            git reset HEAD -- .
+            
+            # Pastikan folder ini sesuai dengan output_dir di config.yaml (misal: loot_kode atau Candidates)
+            git add loot_kode Candidates 2>/dev/null || true
+
+            if git diff --staged --quiet; then
+              echo "Tidak ada data baru."
+              exit 0
+            fi
+
+            git commit -m "chore(indexer): perbarui data Front-Gate [skip ci]"
+            if git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
