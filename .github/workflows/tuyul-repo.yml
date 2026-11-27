@@ -1,4 +1,4 @@
-name: Tuyul Full-Repo Code Harvester
+name: Tuyul Raw-Tree Code Harvester
 # Copyright (c) 2026 EazyWhale (https://github.com/lonion-1)
 # Licensed under the MIT
 
@@ -38,34 +38,32 @@ jobs:
         with:
           python-version: '3.15t'
 
-      - name: Jalankan Full-Repo Harvester
+      - name: Jalankan Tuyul Harvester (Struktur File Asli)
         env:
           DRY_RUN: ${{ inputs.dry_run }}
           FORCE_REFRESH: ${{ inputs.force_refresh }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 - << 'EOF'
-          import os, json, gzip, hashlib, time
+          import os, json, shutil
           import urllib.request
           import urllib.parse
           from datetime import datetime, timezone
           from concurrent.futures import ThreadPoolExecutor, as_completed
 
           # === KONFIGURASI ===
-          USER_AGENT = "TuyulHarvester/2.0 (Python-3.15t)"
+          USER_AGENT = "TuyulHarvester/3.0 (Python-3.15t)"
           TIMEOUT_SEC = 20
-          MAX_WORKERS = 8
+          MAX_WORKERS = 12
           OUTPUT_DIR = "./loot_kode"
           MANIFEST_FILE = "manifest.jsonl"
-          ROTATE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB per file target
-          GZIP_LEVEL = 6
-          MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024  # Skip file > 2MB (misal wordlist raksasa)
+          MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024  # Skip file > 2MB
 
           DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
           FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
           GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-          # Daftar repositori target (nama file output akan mengikuti "name")
+          # Daftar repositori target (nama folder output akan mengikuti "name")
           REPOS = [
               {"name": "httpx", "repo": "projectdiscovery/httpx"},
               {"name": "subfinder", "repo": "projectdiscovery/subfinder"},
@@ -95,13 +93,12 @@ jobs:
               with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
                   return json.loads(resp.read().decode("utf-8"))
 
-          def fetch_raw_file(repo_full, branch, file_path):
+          def fetch_raw_bytes(repo_full, branch, file_path):
               encoded_path = urllib.parse.quote(file_path)
               raw_url = f"https://raw.githubusercontent.com/{repo_full}/{branch}/{encoded_path}"
               req = urllib.request.Request(raw_url, headers={"User-Agent": USER_AGENT})
               with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
-                  raw_bytes = resp.read()
-                  return raw_bytes
+                  return resp.read()
 
           def is_wanted_file(path, size):
               if size > MAX_SINGLE_FILE_BYTES or size == 0:
@@ -111,15 +108,6 @@ jobs:
                   return True
               _, ext = os.path.splitext(base.lower())
               return ext in ALLOWED_EXTS
-
-          def rotate_if_needed(file_path):
-              if os.path.exists(file_path) and os.path.getsize(file_path) >= ROTATE_MAX_BYTES:
-                  ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-                  gz_path = f"{file_path}.{ts}.gz"
-                  with open(file_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=GZIP_LEVEL) as f_out:
-                      f_out.writelines(f_in)
-                  os.remove(file_path)
-                  print(f"  [ROTATE] Diarsipkan ke {gz_path}")
 
           def load_last_commits(manifest_path):
               last_commits = {}
@@ -138,7 +126,7 @@ jobs:
               repo_full = target["repo"]
               print(f"\n=== Memeriksa {name} ({repo_full}) ===")
 
-              # 1. Ambil metadata repo (branch, license, stars, pushed_at)
+              # 1. Ambil metadata repo
               repo_meta = api_get_json(f"https://api.github.com/repos/{repo_full}")
               branch = repo_meta.get("default_branch", "main")
               license_info = repo_meta.get("license") or {}
@@ -146,7 +134,7 @@ jobs:
               pushed_at = repo_meta.get("pushed_at", "")
               stars = repo_meta.get("stargazers_count", 0)
 
-              # 2. Ambil info commit terbaru di default branch
+              # 2. Ambil info commit terbaru
               branch_meta = api_get_json(f"https://api.github.com/repos/{repo_full}/branches/{branch}")
               commit_obj = branch_meta.get("commit", {})
               commit_sha = commit_obj.get("sha", "")
@@ -158,9 +146,6 @@ jobs:
 
               # 3. Ambil seluruh pohon file secara rekursif
               tree_data = api_get_json(f"https://api.github.com/repos/{repo_full}/git/trees/{commit_sha}?recursive=1")
-              if tree_data.get("truncated"):
-                  print(f"  [WARN] Tree terpotong oleh limit GitHub API untuk {repo_full}")
-
               blobs = [
                   item for item in tree_data.get("tree", [])
                   if item.get("type") == "blob" and is_wanted_file(item["path"], item.get("size", 0))
@@ -170,55 +155,44 @@ jobs:
               if DRY_RUN:
                   return {"name": name, "status": "dry_run", "files": len(blobs)}
 
-              # 4. Unduh semua file secara paralel
-              harvested_at = datetime.now(timezone.utc).isoformat()
-              records = []
+              # 4. Bersihkan folder target lama (jika ada pembaruan) agar file yang dihapus di upstream ikut bersih
+              target_dir = os.path.join(OUTPUT_DIR, name)
+              if os.path.exists(target_dir):
+                  shutil.rmtree(target_dir)
+              os.makedirs(target_dir, exist_ok=True)
 
-              def download_worker(blob):
-                  fpath = blob["path"]
-                  raw_bytes = fetch_raw_file(repo_full, branch, fpath)
-                  content = raw_bytes.decode("utf-8", errors="replace")
-                  return {
-                      "name": name,
-                      "repo": repo_full,
-                      "branch": branch,
-                      "license": license_spdx,
-                      "commit_sha": commit_sha,
-                      "last_commit_date": commit_date,
-                      "harvested_at": harvested_at,
-                      "file_path": fpath,
-                      "git_blob_sha": blob.get("sha", ""),
-                      "sha256": hashlib.sha256(raw_bytes).hexdigest(),
-                      "size_bytes": len(raw_bytes),
-                      "lines": content.count("\n") + 1,
-                      "code": content
-                  }
+              # 5. Unduh & tulis langsung sebagai file asli (.go, .rs, .py, dll.)
+              saved_count = 0
+              total_bytes = 0
+
+              def download_and_write(blob):
+                  rel_path = blob["path"]
+                  # Mencegah path traversal
+                  safe_rel = os.path.normpath(rel_path).lstrip("/\\")
+                  if safe_rel.startswith(".."):
+                      return 0
+                  dest_path = os.path.join(target_dir, safe_rel)
+                  os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+                  raw_bytes = fetch_raw_bytes(repo_full, branch, rel_path)
+                  with open(dest_path, "wb") as f:
+                      f.write(raw_bytes)
+                  return len(raw_bytes)
 
               with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-                  futures = {pool.submit(download_worker, b): b["path"] for b in blobs}
+                  futures = {pool.submit(download_and_write, b): b["path"] for b in blobs}
                   for fut in as_completed(futures):
                       fpath = futures[fut]
                       try:
-                          records.append(fut.result())
+                          sz = fut.result()
+                          if sz > 0:
+                              saved_count += 1
+                              total_bytes += sz
                       except Exception as e:
                           print(f"  [ERR] Gagal tarik {fpath}: {e}")
 
-              # Urutkan berdasarkan file_path agar rapi dibaca
-              records.sort(key=lambda x: x["file_path"])
-
-              # 5. Simpan ke file khusus sesuai nama target (mis. loot_kode/httpx.jsonl)
-              os.makedirs(OUTPUT_DIR, exist_ok=True)
-              target_out_path = os.path.join(OUTPUT_DIR, f"{name}.jsonl")
-              with open(target_out_path, "w", encoding="utf-8") as tf:
-                  for rec in records:
-                      tf.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-              rotate_if_needed(target_out_path)
-
-              total_bytes = sum(r["size_bytes"] for r in records)
-              print(f"  [DONE] Tersimpan {len(records)} file ({total_bytes / 1024:.1f} KB) -> {target_out_path}")
-
-              return {
+              harvested_at = datetime.now(timezone.utc).isoformat()
+              summary = {
                   "harvested_at": harvested_at,
                   "name": name,
                   "repo": repo_full,
@@ -227,10 +201,17 @@ jobs:
                   "stars": stars,
                   "commit_sha": commit_sha,
                   "last_commit_date": commit_date,
-                  "files_count": len(records),
+                  "files_count": saved_count,
                   "total_bytes": total_bytes,
-                  "output_file": f"{name}.jsonl"
+                  "output_dir": f"{OUTPUT_DIR}/{name}"
               }
+
+              # Simpan _META.json di dalam folder masing-masing target
+              with open(os.path.join(target_dir, "_META.json"), "w", encoding="utf-8") as mf:
+                  json.dump(summary, mf, indent=2)
+
+              print(f"  [DONE] {saved_count} file asli tersimpan ({total_bytes / 1024:.1f} KB) -> {target_dir}/")
+              return summary
 
           def main():
               os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -268,7 +249,7 @@ jobs:
               exit 0
             fi
 
-            git commit -m "chore(harvester): panen full-repo target [skip ci]"
+            git commit -m "chore(harvester): panen raw source code target [skip ci]"
             if git push origin "HEAD:$BRANCH"; then
               exit 0
             fi
