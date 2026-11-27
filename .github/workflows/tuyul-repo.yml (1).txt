@@ -1,0 +1,310 @@
+name: Tuyul Raw-Tree Code Harvester
+# Copyright (c) 2026 EazyWhale (https://github.com/lonion-1)
+# Licensed under the MIT
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry-run (tes tarik tanpa simpan ke repo)'
+        type: boolean
+        default: false
+      force_refresh:
+        description: 'Paksa tarik ulang meski commit SHA belum berubah'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '40 17 */2 * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tuyul-code-harvester
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Ambil isi repo
+        uses: actions/checkout@v4
+
+      - name: Pasang Python 3.15 Free-Threaded
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.15t'
+
+      - name: Jalankan Tuyul Harvester (Struktur File Asli per Folder Root)
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE_REFRESH: ${{ inputs.force_refresh }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'EOF'
+          import os, json, shutil
+          import urllib.request
+          import urllib.parse
+          from datetime import datetime, timezone
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          # === KONFIGURASI ===
+          USER_AGENT = "TuyulHarvester/3.1 (Python-3.15t)"
+          TIMEOUT_SEC = 20
+          MAX_WORKERS = 12
+          OUTPUT_DIR = "."  # Langsung ke folder masing-masing target di root (misal: ./katana/)
+          MANIFEST_FILE = ".harvester_manifest.jsonl"
+          MAX_SINGLE_FILE_BYTES = 2 * 1024 * 1024  # Skip file > 2MB
+
+          DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+          FORCE_REFRESH = os.getenv("FORCE_REFRESH", "false").lower() == "true"
+          GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+          # Daftar repositori target (duplikat sudah dibersihkan)
+          REPOS = [
+              {"name": "httpx", "repo": "projectdiscovery/httpx"},
+              {"name": "subfinder", "repo": "projectdiscovery/subfinder"},
+              {"name": "nuclei", "repo": "projectdiscovery/nuclei"},
+              {"name": "katana", "repo": "projectdiscovery/katana"},
+              {"name": "feroxbuster", "repo": "epi052/feroxbuster"},
+              {"name": "phishuntangler", "repo": "bishopfox/phishuntangler"},
+              {"name": "apkid", "repo": "rednaga/APKiD"},
+              {"name": "certstream-server-go", "repo": "d-Rickyy-b/certstream-server-go"},
+              {"name": "gotor", "repo": "DedSecInside/gotor"},
+              {"name": "Darkweb-search-engine", "repo": "NexvisionLab/Darkweb-search-engine"},
+              {"name": "colly", "repo": "gocolly/colly"},
+              {"name": "tantivy", "repo": "quickwit-oss/tantivy"},
+              {"name": "iocsearcher", "repo": "malicialab/iocsearcher"},
+              {"name": "iocextract", "repo": "pedramamini/iocextract"},
+              {"name": "pyo3", "repo": "PyO3/pyo3"},
+              {"name": "maturin", "repo": "PyO3/maturin"},
+              {"name": "pii-regex", "repo": "madisonmay/CommonRegex"},
+              {"name": "scrubadub", "repo": "LeapBeyond/scrubadub"},
+              {"name": "presidio-analyzer-rules", "repo": "microsoft/presidio"},
+              {"name": "phishing_catcher", "repo": "x0rz/phishing_catcher"},
+              {"name": "Phishing-Kit-Hunter", "repo": "t4d/Phishing-Kit-Hunter"},
+              {"name": "crypto-regex", "repo": "k4m4/crypto-regex"},
+              {"name": "indonesian-gambling-keywords", "repo": "mrizky17/indonesian-gambling-keywords"},
+              {"name": "blocklist-judol", "repo": "alsyundawy/TrustPositif-To-RPZ-BlockList"},
+              {"name": "yara-rules", "repo": "Yara-Rules/rules"},
+              {"name": "xnLinkFinder", "repo": "xnl-h4ck3r/xnLinkFinder"},
+              {"name": "LinkFinder", "repo": "GerbenJavado/LinkFinder"},
+              {"name": "waymore", "repo": "xnl-h4ck3r/waymore"},
+              {"name": "redirect-checker", "repo": "j3ssie/go-redirect"},
+              {"name": "unshorten", "repo": "bfontaine/unshorten"},
+              {"name": "urlfinder", "repo": "projectdiscovery/urlfinder"},
+              {"name": "gau", "repo": "lc/gau"},
+          ]
+
+          # Folder proteksi agar tidak pernah tertimpa/terhapus
+          PROTECTED_NAMES = {".git", ".github", "osint-indexer", "osint-bridge"}
+
+          # Ekstensi file yang relevan untuk dibedah
+          ALLOWED_EXTS = {
+              ".go", ".rs", ".py", ".sh", ".yaml", ".yml", ".toml",
+              ".json", ".mod", ".sum", ".md", ".txt", ".c", ".h", ".js", ".ts"
+          }
+          ALLOWED_FILENAMES = {"Dockerfile", "Makefile", "LICENSE", "LICENSE.GPL", "LICENSE.MIT"}
+
+          def api_get_json(url):
+              headers = {
+                  "User-Agent": USER_AGENT,
+                  "Accept": "application/vnd.github+json"
+              }
+              if GITHUB_TOKEN:
+                  headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          def fetch_raw_bytes(repo_full, branch, file_path):
+              encoded_path = urllib.parse.quote(file_path)
+              raw_url = f"https://raw.githubusercontent.com/{repo_full}/{branch}/{encoded_path}"
+              req = urllib.request.Request(raw_url, headers={"User-Agent": USER_AGENT})
+              with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+                  return resp.read()
+
+          def is_wanted_file(path, size):
+              if size > MAX_SINGLE_FILE_BYTES or size == 0:
+                  return False
+              base = os.path.basename(path)
+              if base in ALLOWED_FILENAMES:
+                  return True
+              _, ext = os.path.splitext(base.lower())
+              return ext in ALLOWED_EXTS
+
+          def load_last_commits(manifest_path):
+              last_commits = {}
+              if os.path.exists(manifest_path):
+                  with open(manifest_path, "r", encoding="utf-8") as mf:
+                      for line in mf:
+                          try:
+                              entry = json.loads(line)
+                              last_commits[entry["name"]] = entry.get("commit_sha")
+                          except Exception:
+                              pass
+              return last_commits
+
+          def harvest_repo(target, last_commits):
+              name = target["name"].strip().strip("/\")
+              if not name or name in PROTECTED_NAMES or ".." in name:
+                  print(f"  [WARN] Nama target tidak diizinkan: {name}")
+                  return None
+
+              repo_full = target["repo"]
+              print(f"\n=== Memeriksa {name} ({repo_full}) ===")
+
+              # 1. Ambil metadata repo
+              repo_meta = api_get_json(f"https://api.github.com/repos/{repo_full}")
+              branch = repo_meta.get("default_branch", "main")
+              license_info = repo_meta.get("license") or {}
+              license_spdx = license_info.get("spdx_id") or license_info.get("name") or "NONE"
+              pushed_at = repo_meta.get("pushed_at", "")
+              stars = repo_meta.get("stargazers_count", 0)
+
+              # 2. Ambil info commit terbaru
+              branch_meta = api_get_json(f"https://api.github.com/repos/{repo_full}/branches/{branch}")
+              commit_obj = branch_meta.get("commit", {})
+              commit_sha = commit_obj.get("sha", "")
+              commit_date = commit_obj.get("commit", {}).get("committer", {}).get("date", pushed_at)
+
+              if not FORCE_REFRESH and last_commits.get(name) == commit_sha:
+                  print(f"  [SKIP] Tidak ada commit baru (SHA: {commit_sha[:8]})")
+                  return None
+
+              # 3. Ambil seluruh pohon file secara rekursif
+              tree_data = api_get_json(f"https://api.github.com/repos/{repo_full}/git/trees/{commit_sha}?recursive=1")
+              blobs = [
+                  item for item in tree_data.get("tree", [])
+                  if item.get("type") == "blob" and is_wanted_file(item["path"], item.get("size", 0))
+              ]
+              print(f"  [INFO] Branch: {branch} | License: {license_spdx} | Commit: {commit_sha[:8]} | File target: {len(blobs)}")
+
+              if DRY_RUN:
+                  return {"name": name, "status": "dry_run", "files": len(blobs)}
+
+              # 4. Bersihkan folder target masing-masing (misal: ./katana/) agar update upstream bersih
+              target_dir = os.path.join(OUTPUT_DIR, name)
+              if os.path.exists(target_dir):
+                  shutil.rmtree(target_dir)
+              os.makedirs(target_dir, exist_ok=True)
+
+              # 5. Unduh & tulis langsung ke dalam folder target masing-masing
+              saved_count = 0
+              total_bytes = 0
+
+              def download_and_write(blob):
+                  rel_path = blob["path"]
+                  safe_rel = os.path.normpath(rel_path).lstrip("/\")
+                  if safe_rel.startswith(".."):
+                      return 0
+                  dest_path = os.path.join(target_dir, safe_rel)
+                  os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+                  raw_bytes = fetch_raw_bytes(repo_full, branch, rel_path)
+                  with open(dest_path, "wb") as f:
+                      f.write(raw_bytes)
+                  return len(raw_bytes)
+
+              with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                  futures = {pool.submit(download_and_write, b): b["path"] for b in blobs}
+                  for fut in as_completed(futures):
+                      fpath = futures[fut]
+                      try:
+                          sz = fut.result()
+                          if sz > 0:
+                              saved_count += 1
+                              total_bytes += sz
+                      except Exception as e:
+                          print(f"  [ERR] Gagal tarik {fpath}: {e}")
+
+              harvested_at = datetime.now(timezone.utc).isoformat()
+              summary = {
+                  "harvested_at": harvested_at,
+                  "name": name,
+                  "repo": repo_full,
+                  "branch": branch,
+                  "license": license_spdx,
+                  "stars": stars,
+                  "commit_sha": commit_sha,
+                  "last_commit_date": commit_date,
+                  "files_count": saved_count,
+                  "total_bytes": total_bytes,
+                  "output_dir": f"{name}/"
+              }
+
+              # Simpan _META.json di dalam folder masing-masing target
+              with open(os.path.join(target_dir, "_META.json"), "w", encoding="utf-8") as mf:
+                  json.dump(summary, mf, indent=2)
+
+              print(f"  [DONE] {saved_count} file asli tersimpan ({total_bytes / 1024:.1f} KB) -> {name}/")
+              return summary
+
+          def main():
+              manifest_path = os.path.join(OUTPUT_DIR, MANIFEST_FILE)
+              last_commits = load_last_commits(manifest_path)
+
+              # Hapus folder pembungkus lama 'loot_kode' jika masih tersisa
+              if not DRY_RUN and os.path.exists("loot_kode"):
+                  shutil.rmtree("loot_kode")
+
+              updated_entries = {}
+              for target in REPOS:
+                  try:
+                      summary = harvest_repo(target, last_commits)
+                      if summary and not DRY_RUN:
+                          updated_entries[target["name"]] = summary
+                  except Exception as e:
+                      print(f"  [FATAL] Gagal memproses repo {target['repo']}: {e}")
+
+              # Update manifest secara rapi tanpa menumpuk baris lama yang sama
+              if updated_entries and not DRY_RUN:
+                  existing = {}
+                  if os.path.exists(manifest_path):
+                      with open(manifest_path, "r", encoding="utf-8") as mf:
+                          for line in mf:
+                              try:
+                                  obj = json.loads(line)
+                                  existing[obj["name"]] = obj
+                              except Exception:
+                                  pass
+                  existing.update(updated_entries)
+                  with open(manifest_path, "w", encoding="utf-8") as mf:
+                      for entry in existing.values():
+                          mf.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Simpan hasil panen ke GitHub
+        if: inputs.dry_run != true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          for i in 1 2 3; do
+            git fetch origin "$BRANCH"
+            git reset --soft "origin/$BRANCH"
+            git reset HEAD -- .
+
+            # Stage seluruh perubahan pada folder target & hapus sisa loot_kode lama jika ada
+            git add -A
+            git reset -- .github/
+
+            if git diff --staged --quiet; then
+              echo "Tidak ada pembaruan kode."
+              exit 0
+            fi
+
+            git commit -m "chore(harvester): panen raw source code ke folder target [skip ci]"
+            if git push origin "HEAD:$BRANCH"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          exit 1
