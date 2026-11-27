@@ -1,20 +1,12 @@
-name: Front-Gate Web Indexer (Tier 1)
+name: Tuyul Code Harvester
 # Copyright (c) 2026 EazyWhale (https://github.com/lonion-1)
 # Licensed under the MIT
 
 on:
   workflow_dispatch:
     inputs:
-      minutes:
-        description: 'Durasi maksimal (menit)'
-        type: string
-        default: '120'
-      cats:
-        description: 'Batasi kategori (koma, mis. comic,film,judol). Kosong = semua'
-        type: string
-        default: ''
       dry_run:
-        description: 'Dry-run (tidak menulis file apa pun)'
+        description: 'Dry-run (tes tarik tanpa simpan ke repo)'
         type: boolean
         default: false
   schedule:
@@ -24,13 +16,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: frontgate-webindex
+  group: tuyul-code-harvester
   cancel-in-progress: false
 
 jobs:
-  index:
+  harvest:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       PYTHONUNBUFFERED: "1"
     steps:
@@ -42,27 +34,114 @@ jobs:
         with:
           python-version: '3.15t'
 
-      - name: Pasang dependensi Python
+      - name: Jalankan Tuyul Harvester (Tanpa Dependency Eksternal)
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python3 - << 'EOF'
+          import os, json, gzip, hashlib, time
+          import urllib.request
+          from datetime import datetime, timezone
+          from concurrent.futures import ThreadPoolExecutor, as_completed
 
-      - name: Jalankan Harvester / Indexer
-        run: |
-          # Ganti 'main.py' dengan nama skrip Python Anda yang membaca config.yaml
-          python main.py --config config.yaml \
-            --minutes "${{ inputs.minutes || '120' }}" \
-            --cats "${{ inputs.cats }}" \
-            ${{ inputs.dry_run && '--dry-run' || '' }}
+          # === KONFIGURASI ===
+          USER_AGENT = "TuyulHarvester/1.0 (Python-3.15t)"
+          TIMEOUT_SEC = 15
+          MAX_WORKERS = 8
+          OUTPUT_DIR = "./loot_kode"
+          MANIFEST_FILE = "manifest.jsonl"
+          HOT_FILE = "harvester_loot.jsonl"
+          ROTATE_MAX_BYTES = 256 * 1024 * 1024  # 256 MB
+          GZIP_LEVEL = 6
+          DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
-      - name: Simpan cache indeks
-        if: always() && inputs.dry_run != true
-        uses: actions/cache/save@v4
-        with:
-          path: .cache/webindex
-          key: webindex-${{ github.run_id }}
+          TARGETS = [
+              {"name": "httpx_runner", "lang": "go", "url": "https://raw.githubusercontent.com/projectdiscovery/httpx/main/runner/runner.go"},
+              {"name": "subfinder_runner", "lang": "go", "url": "https://raw.githubusercontent.com/projectdiscovery/subfinder/dev/v2/pkg/runner/runner.go"},
+              {"name": "nuclei_runner", "lang": "go", "url": "https://raw.githubusercontent.com/projectdiscovery/nuclei/main/internal/runner/runner.go"},
+              {"name": "katana_runner", "lang": "go", "url": "https://raw.githubusercontent.com/projectdiscovery/katana/main/internal/runner/runner.go"},
+              {"name": "ferox_scanner", "lang": "rust", "url": "https://raw.githubusercontent.com/epi052/feroxbuster/main/src/scanner/ferox_scanner.rs"},
+              {"name": "phishuntangler", "lang": "python", "url": "https://raw.githubusercontent.com/bishopfox/phishuntangler/main/phishuntangler.py"},
+              {"name": "apkid", "lang": "python", "url": "https://raw.githubusercontent.com/rednaga/APKiD/master/apkid/apkid.py"},
+              {"name": "certstream_watcher", "lang": "go", "url": "https://raw.githubusercontent.com/d-Rickyy-b/certstream-server-go/master/internal/certstream/watcher.go"},
+          ]
 
-      - name: Simpan hasil ke GitHub
+          def fetch_target(target):
+              req = urllib.request.Request(target["url"], headers={"User-Agent": USER_AGENT})
+              with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+                  raw_bytes = resp.read()
+                  content = raw_bytes.decode("utf-8", errors="replace")
+                  sha256 = hashlib.sha256(raw_bytes).hexdigest()
+                  return {
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                      "name": target["name"],
+                      "lang": target["lang"],
+                      "url": target["url"],
+                      "sha256": sha256,
+                      "size_bytes": len(raw_bytes),
+                      "code": content
+                  }
+
+          def rotate_if_needed(hot_path):
+              if os.path.exists(hot_path) and os.path.getsize(hot_path) >= ROTATE_MAX_BYTES:
+                  ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                  gz_path = f"{hot_path}.{ts}.gz"
+                  with open(hot_path, "rb") as f_in, gzip.open(gz_path, "wb", compresslevel=GZIP_LEVEL) as f_out:
+                      f_out.writelines(f_in)
+                  os.remove(hot_path)
+                  print(f"[ROTATE] Diarsipkan ke {gz_path}")
+
+          def main():
+              print(f"Memulai panen {len(TARGETS)} target (Dry-run: {DRY_RUN})...")
+              results = []
+              with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                  futures = {pool.submit(fetch_target, t): t for t in TARGETS}
+                  for fut in as_completed(futures):
+                      t = futures[fut]
+                      try:
+                          data = fut.result()
+                          results.append(data)
+                          print(f"[OK] {t['name']} ({data['size_bytes']} bytes)")
+                      except Exception as e:
+                          print(f"[ERR] {t['name']}: {e}")
+
+              if DRY_RUN or not results:
+                  print("Selesai (tidak ada file yang ditulis).")
+                  return
+
+              os.makedirs(OUTPUT_DIR, exist_ok=True)
+              hot_path = os.path.join(OUTPUT_DIR, HOT_FILE)
+              manifest_path = os.path.join(OUTPUT_DIR, MANIFEST_FILE)
+
+              # Cek hash lama di manifest agar tidak duplikat kalau kode belum berubah
+              known_hashes = set()
+              if os.path.exists(manifest_path):
+                  with open(manifest_path, "r", encoding="utf-8") as mf:
+                      for line in mf:
+                          try:
+                              known_hashes.add(json.loads(line).get("sha256"))
+                          except Exception:
+                              pass
+
+              new_count = 0
+              with open(hot_path, "a", encoding="utf-8") as hf, open(manifest_path, "a", encoding="utf-8") as mf:
+                  for item in results:
+                      if item["sha256"] in known_hashes:
+                          print(f"[SKIP] {item['name']} (kode belum berubah)")
+                          continue
+                      hf.write(json.dumps(item, ensure_ascii=False) + "\n")
+                      meta = {k: v for k, v in item.items() if k != "code"}
+                      mf.write(json.dumps(meta, ensure_ascii=False) + "\n")
+                      new_count += 1
+
+              rotate_if_needed(hot_path)
+              print(f"Total {new_count} kode baru disimpan ke {OUTPUT_DIR}/")
+
+          if __name__ == "__main__":
+              main()
+          EOF
+
+      - name: Simpan hasil panen ke GitHub
         if: inputs.dry_run != true
         run: |
           git config user.name "github-actions[bot]"
@@ -73,16 +152,14 @@ jobs:
             git fetch origin "$BRANCH"
             git reset --soft "origin/$BRANCH"
             git reset HEAD -- .
-            
-            # Pastikan folder ini sesuai dengan output_dir di config.yaml (misal: loot_kode atau Candidates)
-            git add loot_kode Candidates 2>/dev/null || true
+            git add loot_kode
 
             if git diff --staged --quiet; then
-              echo "Tidak ada data baru."
+              echo "Tidak ada loot baru."
               exit 0
             fi
 
-            git commit -m "chore(indexer): perbarui data Front-Gate [skip ci]"
+            git commit -m "chore(harvester): panen kode baru [skip ci]"
             if git push origin "HEAD:$BRANCH"; then
               exit 0
             fi
